@@ -28,6 +28,7 @@ use std::io;
 use std::io::Error;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputEvent {
@@ -56,7 +57,11 @@ impl From<InputEvent> for DKEvent {
     }
 }
 
-pub struct KbdIn {}
+pub struct KbdIn {
+    include_names: Option<Vec<String>>,
+    exclude_names: Option<Vec<String>>,
+    last_rediscover_time: Instant,
+}
 
 impl Drop for KbdIn {
     fn drop(&mut self) {
@@ -129,7 +134,11 @@ impl KbdIn {
 
         if !device_names.is_empty() || register_device("") {
             if grab() {
-                Ok(Self {})
+                Ok(Self {
+                    include_names,
+                    exclude_names,
+                    last_rediscover_time: Instant::now(),
+                })
             } else {
                 Err(anyhow!("grab failed"))
             }
@@ -142,6 +151,17 @@ impl KbdIn {
     }
 
     pub fn read(&mut self) -> Result<InputEvent, io::Error> {
+        // Periodically rediscover devices to handle reconnections
+        // Check every 5 seconds when include/exclude names are configured
+        let now = Instant::now();
+        if now.duration_since(self.last_rediscover_time) >= Duration::from_secs(5) 
+            && (self.include_names.is_some() || self.exclude_names.is_some()) {
+            if let Err(e) = self.rediscover_devices() {
+                log::warn!("device rediscovery failed: {}", e);
+            }
+            self.last_rediscover_time = now;
+        }
+
         let mut event = DKEvent {
             value: 0,
             page: 0,
@@ -151,6 +171,37 @@ impl KbdIn {
         wait_key(&mut event);
 
         Ok(InputEvent::new(event))
+    }
+
+    /// Rediscover and register devices based on current include/exclude filters.
+    /// This is called when devices might have been reconnected.
+    fn rediscover_devices(&mut self) -> Result<(), anyhow::Error> {
+        log::info!("rediscovering devices for macOS");
+        
+        let device_names = if let Some(ref names) = self.include_names {
+            validate_and_register_devices(names.clone())
+        } else if let Some(ref names) = self.exclude_names {
+            let kb_list = capture_stdout(list_keyboards);
+            let names_: Vec<String> = kb_list
+                .split("\n")
+                .filter(|kb| {
+                    let kb_trimmed = kb.trim();
+                    !kb_trimmed.is_empty() && !names.contains(&kb_trimmed.to_string())
+                })
+                .map(|kb| kb.trim().to_string())
+                .collect();
+            validate_and_register_devices(names_)
+        } else {
+            vec![]
+        };
+
+        // If we found devices, we don't need to do anything else since they're already registered
+        // The Karabiner driver will handle the device management internally
+        if !device_names.is_empty() {
+            log::info!("rediscovered {} devices", device_names.len());
+        }
+
+        Ok(())
     }
 }
 
@@ -460,5 +511,64 @@ impl KbdOut {
             MoveDirection::Left => mouse_position.x -= _mv.distance as CGFloat,
             MoveDirection::Right => mouse_position.x += _mv.distance as CGFloat,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Test the device filtering logic used in rediscovery
+    #[test]
+    fn test_device_filtering_with_exclude() {
+        let exclude_names = vec!["Apple Internal Keyboard / Trackpad".to_string()];
+        let kb_list = "Apple Internal Keyboard / Trackpad\nLogitech MX Keys\nRazer BlackWidow\n";
+        
+        let filtered_names: Vec<String> = kb_list
+            .split("\n")
+            .filter(|kb| {
+                let kb_trimmed = kb.trim();
+                !kb_trimmed.is_empty() && !exclude_names.contains(&kb_trimmed.to_string())
+            })
+            .map(|kb| kb.trim().to_string())
+            .collect();
+        
+        assert_eq!(filtered_names, vec!["Logitech MX Keys", "Razer BlackWidow"]);
+    }
+
+    #[test]  
+    fn test_device_filtering_empty_exclude() {
+        let exclude_names: Vec<String> = vec![];
+        let kb_list = "Apple Internal Keyboard / Trackpad\nLogitech MX Keys\nRazer BlackWidow\n";
+        
+        let filtered_names: Vec<String> = kb_list
+            .split("\n")
+            .filter(|kb| {
+                let kb_trimmed = kb.trim();
+                !kb_trimmed.is_empty() && !exclude_names.contains(&kb_trimmed.to_string())
+            })
+            .map(|kb| kb.trim().to_string())
+            .collect();
+        
+        assert_eq!(filtered_names, vec!["Apple Internal Keyboard / Trackpad", "Logitech MX Keys", "Razer BlackWidow"]);
+    }
+
+    #[test]
+    fn test_device_filtering_exclude_all() {
+        let exclude_names = vec![
+            "Apple Internal Keyboard / Trackpad".to_string(),
+            "Logitech MX Keys".to_string(), 
+            "Razer BlackWidow".to_string()
+        ];
+        let kb_list = "Apple Internal Keyboard / Trackpad\nLogitech MX Keys\nRazer BlackWidow\n";
+        
+        let filtered_names: Vec<String> = kb_list
+            .split("\n")
+            .filter(|kb| {
+                let kb_trimmed = kb.trim();
+                !kb_trimmed.is_empty() && !exclude_names.contains(&kb_trimmed.to_string())
+            })
+            .map(|kb| kb.trim().to_string())
+            .collect();
+        
+        assert_eq!(filtered_names, Vec::<String>::new());
     }
 }
