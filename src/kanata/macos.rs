@@ -124,9 +124,20 @@ impl Kanata {
         // See `oskbd::start_screen_lock_poller` for the design notes.
         crate::oskbd::start_screen_lock_poller();
 
+        // Sets `take_new_device_pending()` when a keyboard the device filter
+        // selects is plugged in after startup.
+        kb.start_hotplug_poller();
+
         loop {
+            let mut new_device_connected = false;
             // --- Event processing loop ---
             let needs_recovery = loop {
+                if crate::oskbd::take_new_device_pending() {
+                    info!("new keyboard connected — re-grabbing input devices");
+                    new_device_connected = true;
+                    break true;
+                }
+
                 // Check output health before blocking on input
                 if !kanata.lock().kbd_out.output_ready() {
                     log::warn!("output backend unavailable — releasing input devices");
@@ -235,10 +246,14 @@ impl Kanata {
             // --- Release input so the keyboard works normally (unseized) ---
             kb.release_input();
 
-            info!(
-                "Input devices released. Keyboard is usable (without remapping). \
-                 Waiting for the output backend and console session to recover..."
-            );
+            if new_device_connected {
+                kb.register_new_devices();
+            } else {
+                info!(
+                    "Input devices released. Keyboard is usable (without remapping). \
+                     Waiting for the output backend and console session to recover..."
+                );
+            }
 
             // Re-grab once both the sink is healthy and the session is
             // unpaused. Sleep explicitly when only the sink is ready,

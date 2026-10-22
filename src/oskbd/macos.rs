@@ -29,7 +29,7 @@ use kanata_parser::keys::*;
 use karabiner_driverkit::*;
 use objc::runtime::Class;
 use objc::{msg_send, sel, sel_impl};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt;
 use std::io;
@@ -639,9 +639,16 @@ impl From<InputEvent> for DKEvent {
     }
 }
 
+type InputDevices = Vec<(std::num::NonZeroU8, kanata_parser::cfg::InputDeviceMatcher)>;
+
 pub struct KbdIn {
     grabbed: bool,
     device_hash_to_id: HashMap<u64, std::num::NonZeroU8>,
+    filter: DeviceFilter,
+    input_devices: Option<InputDevices>,
+    /// Devices connected at startup. Handed to the hotplug poller so it only
+    /// reacts to keyboards that show up later.
+    startup_device_hashes: Option<HashSet<u64>>,
 }
 
 impl Drop for KbdIn {
@@ -689,42 +696,24 @@ impl KbdIn {
             ));
         }
 
-        // Based on the definition of include and exclude names, they should never be used together.
-        // Kanata config parser should probably enforce this.
-        let has_device_filter = include_names.is_some() || exclude_names.is_some();
-        let device_names = if let Some(ref included_names) = include_names {
-            validate_and_register_devices(included_names)
-        } else if let Some(ref excluded_names) = exclude_names {
-            // Exclude list: enumerate devices, filter out excluded and
-            // known-problematic virtual devices (Sidecar, etc.), then
-            // register the remainder individually.
-            let kb_list = fetch_devices();
-            let devices_to_include = kb_list
-                .iter()
-                .filter(|k| !excluded_names.iter().any(|n| *k == n.as_str()))
-                .filter(|k| !is_skipped_virtual_device(&k.product_key))
-                .map(|k| {
-                    let name = sanitize_device_name(&k.product_key);
-                    if name.trim().is_empty() {
-                        format!("{:x}", k.hash)
-                    } else {
-                        name.to_string()
-                    }
-                })
-                .collect::<Vec<String>>();
+        // Snapshot before registering, so a keyboard plugged in during
+        // registration is still picked up by the hotplug poller.
+        let startup_device_hashes: HashSet<u64> =
+            fetch_devices_serialized().iter().map(|d| d.hash).collect();
+        let filter = DeviceFilter::new(include_names.clone(), exclude_names);
+        let input_devices: Option<InputDevices> = input_devices.map(|d| d.to_vec());
+        let make =
+            |grabbed: bool, filter: DeviceFilter, input_devices: Option<InputDevices>| Self {
+                grabbed,
+                device_hash_to_id: build_device_hash_to_id_map(input_devices.as_deref()),
+                filter,
+                input_devices,
+                startup_device_hashes: Some(startup_device_hashes.clone()),
+            };
 
-            validate_and_register_devices(&devices_to_include)
-        } else {
-            vec![]
-        };
-
-        if !device_names.is_empty() || (!has_device_filter && register_device("")) {
+        if filter.register_connected() {
             if grab() {
-                let device_hash_to_id = build_device_hash_to_id_map(input_devices);
-                Ok(Self {
-                    grabbed: true,
-                    device_hash_to_id,
-                })
+                Ok(make(true, filter, input_devices))
             } else {
                 // We have already pre-flighted Input Monitoring and
                 // Accessibility, so by this point the most common
@@ -754,14 +743,10 @@ impl KbdIn {
                     "No devices currently connected but listener started. \
                      Waiting for device connection via callback..."
                 );
-                let device_hash_to_id = build_device_hash_to_id_map(input_devices);
-                Ok(Self {
-                    grabbed: false,
-                    device_hash_to_id,
-                })
+                Ok(make(false, filter, input_devices))
             } else {
                 log::info!("No devices registered yet. Polling for device connection...");
-                Self::poll_for_devices(&names, input_devices)
+                Self::poll_for_devices(&names, filter, input_devices, startup_device_hashes.clone())
             }
         } else {
             Err(anyhow!(
@@ -820,9 +805,29 @@ impl KbdIn {
         self.grabbed
     }
 
+    /// Start watching for keyboards that connect after startup. When one
+    /// appears that the device filter selects, `take_new_device_pending()`
+    /// starts returning true. Only the first call starts the poller.
+    pub fn start_hotplug_poller(&mut self) {
+        let Some(known) = self.startup_device_hashes.take() else {
+            return;
+        };
+        start_hotplug_poller(self.filter.clone(), known);
+    }
+
+    /// Register newly connected keyboards that the device filter selects.
+    /// Call between `release_input()` and `regrab_input()`: the driverkit
+    /// listener thread must not be running while its device set changes.
+    pub fn register_new_devices(&mut self) {
+        self.filter.register_connected();
+        self.device_hash_to_id = build_device_hash_to_id_map(self.input_devices.as_deref());
+    }
+
     fn poll_for_devices(
         names: &[String],
-        input_devices: Option<&[(std::num::NonZeroU8, kanata_parser::cfg::InputDeviceMatcher)]>,
+        filter: DeviceFilter,
+        input_devices: Option<InputDevices>,
+        startup_device_hashes: HashSet<u64>,
     ) -> Result<Self, anyhow::Error> {
         let mut poll_count: u32 = 0;
         loop {
@@ -848,15 +853,145 @@ impl KbdIn {
             }
             if any_registered {
                 if grab() {
-                    let device_hash_to_id = build_device_hash_to_id_map(input_devices);
                     return Ok(Self {
                         grabbed: true,
-                        device_hash_to_id,
+                        device_hash_to_id: build_device_hash_to_id_map(input_devices.as_deref()),
+                        filter,
+                        input_devices,
+                        startup_device_hashes: Some(startup_device_hashes),
                     });
                 }
                 log::warn!("Device appeared but grab failed, continuing to poll...");
             }
         }
+    }
+}
+
+/// Which keyboards kanata grabs, from `macos-dev-names-include` /
+/// `macos-dev-names-exclude`. The two should never be used together;
+/// include wins if both are set.
+#[derive(Clone)]
+enum DeviceFilter {
+    All,
+    Include(Vec<String>),
+    Exclude(Vec<String>),
+}
+
+impl DeviceFilter {
+    fn new(include_names: Option<Vec<String>>, exclude_names: Option<Vec<String>>) -> Self {
+        match (include_names, exclude_names) {
+            (Some(names), _) => Self::Include(names),
+            (None, Some(names)) => Self::Exclude(names),
+            (None, None) => Self::All,
+        }
+    }
+
+    /// Whether a keyboard that connects after startup should be grabbed.
+    fn wants(&self, device: &DeviceData) -> bool {
+        match self {
+            Self::All => {
+                !device.product_key.trim().is_empty()
+                    && !is_skipped_virtual_device(&device.product_key)
+            }
+            Self::Include(names) => names.iter().any(|n| device == sanitize_device_name(n)),
+            Self::Exclude(names) => {
+                !names.iter().any(|n| device == n.as_str())
+                    && !is_skipped_virtual_device(&device.product_key)
+            }
+        }
+    }
+
+    /// Register every connected keyboard this filter selects with driverkit.
+    /// Returns true if at least one was registered.
+    fn register_connected(&self) -> bool {
+        match self {
+            Self::All => register_device(""),
+            Self::Include(names) => !validate_and_register_devices(names).is_empty(),
+            Self::Exclude(excluded_names) => {
+                // Enumerate devices, filter out excluded and known-problematic
+                // virtual devices (Sidecar, etc.), then register the remainder
+                // individually.
+                let devices_to_include = fetch_devices_serialized()
+                    .iter()
+                    .filter(|k| !excluded_names.iter().any(|n| *k == n.as_str()))
+                    .filter(|k| !is_skipped_virtual_device(&k.product_key))
+                    .map(|k| {
+                        let name = sanitize_device_name(&k.product_key);
+                        if name.trim().is_empty() {
+                            format!("{:x}", k.hash)
+                        } else {
+                            name.to_string()
+                        }
+                    })
+                    .collect::<Vec<String>>();
+                !validate_and_register_devices(&devices_to_include).is_empty()
+            }
+        }
+    }
+}
+
+/// `fetch_devices` fills static buffers on the C++ side, so calls from the
+/// hotplug poller and the event loop must not overlap.
+fn fetch_devices_serialized() -> Vec<DeviceData> {
+    static FETCH_DEVICES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = FETCH_DEVICES_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fetch_devices()
+}
+
+// --- Keyboard hotplug ---
+//
+// driverkit re-grabs a registered keyboard when it reconnects, but it only
+// knows about keyboards that were connected when kanata registered devices.
+// A keyboard plugged in later is never grabbed.
+//
+// Fix: a background thread polls the device list. When a keyboard appears
+// that kanata has not seen before and the device filter selects, it sets
+// NEW_DEVICE_PENDING. The event loop then releases input, registers the
+// new devices and re-grabs, using the same path as output-backend recovery.
+//
+// Like the screen-lock poller, this can't wake `wait_key()`, which blocks
+// in read(2). The event loop picks the flag up after the next key event
+// from a keyboard it already holds. We don't call `release_input_only`
+// from the poller to wake it sooner, for the FD-reuse reason given in the
+// screen-lock notes above.
+
+static NEW_DEVICE_PENDING: AtomicBool = AtomicBool::new(false);
+const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Returns true once per detected batch of new keyboards.
+pub fn take_new_device_pending() -> bool {
+    NEW_DEVICE_PENDING.swap(false, Ordering::AcqRel)
+}
+
+fn start_hotplug_poller(filter: DeviceFilter, mut known: HashSet<u64>) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("device-hotplug-poller".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(HOTPLUG_POLL_INTERVAL);
+                let mut found = false;
+                for device in fetch_devices_serialized() {
+                    // `known` keeps every hash ever seen, so a reconnecting
+                    // keyboard (which driverkit re-grabs itself) or an
+                    // excluded one triggers nothing.
+                    if known.insert(device.hash) && filter.wants(&device) {
+                        log::info!(
+                            "new keyboard connected: '{}' (hash {:x}); it will be grabbed on the next key event",
+                            device.product_key,
+                            device.hash
+                        );
+                        found = true;
+                    }
+                }
+                if found {
+                    NEW_DEVICE_PENDING.store(true, Ordering::Release);
+                }
+            }
+        })
+    {
+        log::warn!("failed to spawn device hotplug poller thread: {e}");
     }
 }
 
@@ -905,7 +1040,7 @@ fn build_device_hash_to_id_map(
     let Some(matchers) = input_devices else {
         return map;
     };
-    let kb_list = fetch_devices();
+    let kb_list = fetch_devices_serialized();
     for (id, matcher) in matchers.iter() {
         for kb in &kb_list {
             let name_matches = matcher
