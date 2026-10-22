@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+pub mod gamepad;
 #[cfg(all(target_os = "windows", feature = "gui"))]
 pub mod gui;
 pub mod kanata;
@@ -12,6 +13,8 @@ pub mod tcp_server;
 pub mod tests;
 
 pub use kanata::*;
+pub use kanata_parser::cfg::FAKE_KEY_ROW;
+pub use kanata_parser::custom_action::FakeKeyAction;
 pub use tcp_server::TcpServer;
 
 type CfgPath = PathBuf;
@@ -20,7 +23,7 @@ pub struct ValidatedArgs {
     pub paths: Vec<CfgPath>,
     #[cfg(feature = "tcp_server")]
     pub tcp_server_address: Option<SocketAddrWrapper>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub symlink_path: Option<String>,
     pub nodelay: bool,
 }

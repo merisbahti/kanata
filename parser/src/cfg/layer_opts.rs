@@ -6,8 +6,8 @@ pub(crate) type LayerIcons = HashMap<String, Option<String>>;
 
 pub fn parse_layer_opts(list: &[SExpr]) -> Result<HashMap<String, String>> {
     let mut layer_opts: HashMap<String, String> = HashMap::default();
-    let mut opts = list.chunks_exact(2);
-    for kv in opts.by_ref() {
+    let opts = list.as_chunks::<2>();
+    for kv in opts.0.iter() {
         let key_expr = &kv[0];
         let val_expr = &kv[1];
         // Read k-v pairs from the configuration
@@ -41,7 +41,7 @@ pub fn parse_layer_opts(list: &[SExpr]) -> Result<HashMap<String, String>> {
         })?;
         layer_opts.insert(opt_key.to_owned(), opt_val.to_owned());
     }
-    let rem = opts.remainder();
+    let rem = opts.1;
     if !rem.is_empty() {
         bail_expr!(&rem[0], "This option is missing a value.");
     }

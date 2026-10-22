@@ -1,7 +1,8 @@
+use kanata_parser::cfg::WinSyncKeystateBehaviour;
 use parking_lot::Mutex;
 use std::convert::TryFrom;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender as Sender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvError, SyncSender as Sender, TryRecvError, sync_channel};
 use std::time;
 
 use super::PRESSED_KEYS;
@@ -27,6 +28,7 @@ impl Kanata {
 
         let (preprocess_tx, preprocess_rx) = sync_channel(100);
         start_event_preprocessor(preprocess_rx, tx);
+        let kb_preprocess_tx = preprocess_tx.clone();
 
         // This callback should return `false` if the input event is **not** handled by the
         // callback and `true` if the input event **is** handled by the callback. Returning false
@@ -39,7 +41,7 @@ impl Kanata {
             };
 
             check_for_exit(&key_event);
-            let oscode = OsCode::from(input_event.code);
+            let oscode = key_event.code;
             if !MAPPED_KEYS.lock().contains(&oscode) {
                 return false;
             }
@@ -48,15 +50,22 @@ impl Kanata {
             // needs to differentiate between initial press and repeat press.
             log::debug!("event loop: {:?}", key_event);
             match key_event.value {
-                KeyValue::Release => {
-                    PRESSED_KEYS.lock().remove(&key_event.code);
+                KeyValue::Release if PRESSED_KEYS.lock().remove(&key_event.code).is_none() => {
+                    log::debug!("forwarding release of never-seen press {:?}", key_event);
+                    // If we never saw the initial press for this release,
+                    // we should not pass it along to the processing loop.
+                    // There is likely a pressed key in Windows that Kanata never knew about.
+                    // Consuming the release here will mean Windows gets a stuck press.
+                    return false;
                 }
                 KeyValue::Press => {
                     let mut pressed_keys = PRESSED_KEYS.lock();
-                    if pressed_keys.contains(&key_event.code) {
-                        key_event.value = KeyValue::Repeat;
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        pressed_keys.entry(key_event.code)
+                    {
+                        e.insert(web_time::Instant::now());
                     } else {
-                        pressed_keys.insert(key_event.code);
+                        key_event.value = KeyValue::Repeat;
                     }
                 }
                 _ => {}
@@ -67,9 +76,47 @@ impl Kanata {
             // getting full, assuming regular operation of the program and some other bug isn't the
             // problem. I've tried to crash the program by pressing as many keys on my keyboard at
             // the same time as I could, but was unable to.
-            try_send_panic(&preprocess_tx, key_event);
+            try_send_panic(&kb_preprocess_tx, key_event);
             true
         });
+
+        use OsCode::*;
+        let oscodes_for_mhook_active = &[
+            BTN_LEFT,
+            BTN_RIGHT,
+            BTN_MIDDLE,
+            BTN_SIDE,
+            BTN_EXTRA,
+            MouseWheelUp,
+            MouseWheelDown,
+            MouseWheelLeft,
+            MouseWheelRight,
+        ];
+        let _handle = if oscodes_for_mhook_active
+            .iter()
+            .any(|osc| MAPPED_KEYS.lock().contains(osc))
+        {
+            log::info!("Installing mouse hook callback.");
+            let mousehook = MouseHook::set_input_cb(move |mouse_event| {
+                log::debug!("llhook mouse event: {mouse_event:?}");
+                let key_event = match KeyEvent::try_from(mouse_event) {
+                    Ok(ev) => ev,
+                    _ => return false,
+                };
+                let oscode = key_event.code;
+                if !MAPPED_KEYS.lock().contains(&oscode) {
+                    return false;
+                }
+                log::debug!("event loop - mouse: {:?}", key_event);
+                try_send_panic(&preprocess_tx, key_event);
+                true
+            });
+            log::info!("Installed mouse hook callback successfully.");
+            Some(mousehook)
+        } else {
+            log::info!("No mouse inputs were in defsrc on startup. Not activating mouse hook.");
+            None
+        };
 
         #[cfg(all(target_os = "windows", feature = "gui"))]
         let _ui = ui; // prevents thread from panicking on exiting via a GUI
@@ -147,19 +194,38 @@ impl Kanata {
         use kanata_keyberon::layout::*;
         use winapi::um::winuser::*;
 
-        if !self.windows_sync_keystates {
+        if matches!(
+            self.windows_sync_keystates,
+            WinSyncKeystateBehaviour::WinSyncDoNothing
+        ) {
             return;
         }
 
-        log::debug!("synchronizing win keystates");
+        // Note: this procedure (1) used to be also gated behind the config flag.
+        // Revisiting it later, it should be reasonably safe to always run this,
+        // because releasing a Kanata state should not interfere with other programs
+        // in contrast to releasing Windows VK codes which could.
+        log::debug!("synchronizing kanata keystates with windows");
         for pvk in self.prev_keys.iter() {
             // Check 1 : each pvk is expected to be pressed.
             let osc: OsCode = pvk.into();
-            let vk = i32::from(osc);
+
+            let vk = match osc {
+                OsCode::KEY_KPENTER => {
+                    // Special case:
+                    // From scancode info we can differentiate KP Enter vs. Enter
+                    // but we cannot from Windows VK states.
+                    // Check against VK_RETURN
+                    VK_RETURN
+                }
+                _ => i32::from(osc),
+            };
+
             if vk > 254 {
                 // 254 should be highest valid VK number in Windows OS.
                 continue;
             }
+
             let vk_state = unsafe { GetAsyncKeyState(vk) } as u32;
             let is_pressed_in_windows = vk_state >= 0b1000000;
             if is_pressed_in_windows {
@@ -167,7 +233,7 @@ impl Kanata {
             }
 
             log::error!(
-                "Unexpected keycode is pressed in kanata but not in Windows. Clearing kanata states: {pvk}"
+                "Unexpected keycode is pressed in kanata but not in Windows. Clearing kanata states: {pvk:?}"
             );
             // Need to clear internal state about this key.
             // find coordinate(s) in keyberon associated with pvk
@@ -202,6 +268,14 @@ impl Kanata {
             drop(pressed_keys);
         }
 
+        if matches!(
+            self.windows_sync_keystates,
+            WinSyncKeystateBehaviour::WinSyncClearKanataStates
+        ) {
+            return;
+        }
+
+        log::debug!("releasing windows keystates with kanata");
         let mapped_keys = MAPPED_KEYS.lock();
         for mapped_osc in mapped_keys.iter().copied() {
             // Check 2: each active win vk mapped in Kanata should have a value in pvk
@@ -247,92 +321,132 @@ fn try_send_panic(tx: &Sender<KeyEvent>, kev: KeyEvent) {
     }
 }
 
-fn start_event_preprocessor(preprocess_rx: Receiver<KeyEvent>, process_tx: Sender<KeyEvent>) {
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    enum LctlState {
-        Pressed,
-        Released,
-        Pending,
-        PendingReleased,
-        None,
-    }
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LctlState {
+    Pressed,
+    Released,
+    Pending,
+    PendingReleased,
+    None,
+}
 
+#[derive(Debug, Clone, Copy)]
+enum RecvValue {
+    Ok(KeyEvent),
+    Empty,
+    Disconnected,
+}
+
+enum CanBlock {
+    YesCanBlock,
+    NoMustPeriodicPoll,
+}
+
+fn preprocessor_recv(preprocess_rx: &Receiver<KeyEvent>, can_block: CanBlock) -> RecvValue {
+    match can_block {
+        CanBlock::YesCanBlock => match preprocess_rx.recv() {
+            Ok(kev) => RecvValue::Ok(kev),
+            Err(RecvError) => RecvValue::Disconnected,
+        },
+        CanBlock::NoMustPeriodicPoll => match preprocess_rx.try_recv() {
+            Ok(kev) => RecvValue::Ok(kev),
+            Err(TryRecvError::Empty) => RecvValue::Empty,
+            Err(TryRecvError::Disconnected) => RecvValue::Disconnected,
+        },
+    }
+}
+
+fn start_event_preprocessor(preprocess_rx: Receiver<KeyEvent>, process_tx: Sender<KeyEvent>) {
+    use CanBlock::*;
+    use RecvValue::*;
     std::thread::spawn(move || {
         let mut lctl_state = LctlState::None;
+        let mut can_block = NoMustPeriodicPoll;
         loop {
-            match preprocess_rx.try_recv() {
-                Ok(kev) => match (*ALTGR_BEHAVIOUR.lock(), kev) {
-                    (AltGrBehaviour::DoNothing, _) => try_send_panic(&process_tx, kev),
-                    (
-                        AltGrBehaviour::AddLctlRelease,
-                        KeyEvent {
-                            value: KeyValue::Release,
-                            code: OsCode::KEY_RIGHTALT,
-                            ..
-                        },
-                    ) => {
-                        log::debug!("altgr add: adding lctl release");
-                        try_send_panic(&process_tx, kev);
-                        try_send_panic(
-                            &process_tx,
-                            KeyEvent::new(OsCode::KEY_LEFTCTRL, KeyValue::Release),
-                        );
-                        PRESSED_KEYS.lock().remove(&OsCode::KEY_LEFTCTRL);
-                    }
-                    (
-                        AltGrBehaviour::CancelLctlPress,
-                        KeyEvent {
-                            value: KeyValue::Press,
-                            code: OsCode::KEY_LEFTCTRL,
-                            ..
-                        },
-                    ) => {
-                        log::debug!("altgr cancel: lctl state->pressed");
-                        lctl_state = LctlState::Pressed;
-                    }
-                    (
-                        AltGrBehaviour::CancelLctlPress,
-                        KeyEvent {
-                            value: KeyValue::Release,
-                            code: OsCode::KEY_LEFTCTRL,
-                            ..
-                        },
-                    ) => match lctl_state {
-                        LctlState::Pressed => {
-                            log::debug!("altgr cancel: lctl state->released");
-                            lctl_state = LctlState::Released;
+            can_block = match preprocessor_recv(&preprocess_rx, can_block) {
+                Ok(kev) => {
+                    match (*ALTGR_BEHAVIOUR.lock(), kev) {
+                        (AltGrBehaviour::DoNothing, _) => {
+                            try_send_panic(&process_tx, kev);
                         }
-                        LctlState::Pending => {
-                            log::debug!("altgr cancel: lctl state->pending-released");
-                            lctl_state = LctlState::PendingReleased;
+                        (
+                            AltGrBehaviour::AddLctlRelease,
+                            KeyEvent {
+                                value: KeyValue::Release,
+                                code: OsCode::KEY_RIGHTALT,
+                                ..
+                            },
+                        ) => {
+                            log::debug!("altgr add: adding lctl release");
+                            try_send_panic(&process_tx, kev);
+                            try_send_panic(
+                                &process_tx,
+                                KeyEvent::new(OsCode::KEY_LEFTCTRL, KeyValue::Release),
+                            );
+                            PRESSED_KEYS.lock().remove(&OsCode::KEY_LEFTCTRL);
                         }
-                        LctlState::None => try_send_panic(&process_tx, kev),
-                        _ => {}
-                    },
-                    (
-                        AltGrBehaviour::CancelLctlPress,
-                        KeyEvent {
-                            value: KeyValue::Press,
-                            code: OsCode::KEY_RIGHTALT,
-                            ..
+                        (
+                            AltGrBehaviour::CancelLctlPress,
+                            KeyEvent {
+                                value: KeyValue::Press,
+                                code: OsCode::KEY_LEFTCTRL,
+                                ..
+                            },
+                        ) => {
+                            log::debug!("altgr cancel: lctl state->pressed");
+                            lctl_state = LctlState::Pressed;
+                        }
+                        (
+                            AltGrBehaviour::CancelLctlPress,
+                            KeyEvent {
+                                value: KeyValue::Release,
+                                code: OsCode::KEY_LEFTCTRL,
+                                ..
+                            },
+                        ) => match lctl_state {
+                            LctlState::Pressed => {
+                                log::debug!("altgr cancel: lctl state->released");
+                                lctl_state = LctlState::Released;
+                            }
+                            LctlState::Pending => {
+                                log::debug!("altgr cancel: lctl state->pending-released");
+                                lctl_state = LctlState::PendingReleased;
+                            }
+                            LctlState::None => {
+                                try_send_panic(&process_tx, kev);
+                            }
+                            _ => {}
                         },
-                    ) => {
-                        log::debug!("altgr cancel: lctl state->none");
-                        lctl_state = LctlState::None;
-                        try_send_panic(&process_tx, kev);
+                        (
+                            AltGrBehaviour::CancelLctlPress,
+                            KeyEvent {
+                                value: KeyValue::Press,
+                                code: OsCode::KEY_RIGHTALT,
+                                ..
+                            },
+                        ) => {
+                            log::debug!("altgr cancel: lctl state->none");
+                            lctl_state = LctlState::None;
+                            try_send_panic(&process_tx, kev);
+                        }
+                        (_, _) => {
+                            try_send_panic(&process_tx, kev);
+                        }
                     }
-                    (_, _) => try_send_panic(&process_tx, kev),
-                },
-                Err(TryRecvError::Empty) => {
-                    if *ALTGR_BEHAVIOUR.lock() == AltGrBehaviour::CancelLctlPress {
+                    NoMustPeriodicPoll
+                }
+                Empty => {
+                    can_block = if *ALTGR_BEHAVIOUR.lock() == AltGrBehaviour::CancelLctlPress {
                         match lctl_state {
                             LctlState::Pressed => {
                                 log::debug!("altgr cancel: lctl state->pending");
                                 lctl_state = LctlState::Pending;
+                                NoMustPeriodicPoll
                             }
                             LctlState::Released => {
                                 log::debug!("altgr cancel: lctl state->pending-released");
                                 lctl_state = LctlState::PendingReleased;
+                                NoMustPeriodicPoll
                             }
                             LctlState::Pending => {
                                 log::debug!("altgr cancel: lctl state->send");
@@ -341,6 +455,7 @@ fn start_event_preprocessor(preprocess_rx: Receiver<KeyEvent>, process_tx: Sende
                                     KeyEvent::new(OsCode::KEY_LEFTCTRL, KeyValue::Press),
                                 );
                                 lctl_state = LctlState::None;
+                                NoMustPeriodicPoll
                             }
                             LctlState::PendingReleased => {
                                 log::debug!("altgr cancel: lctl state->send+release");
@@ -353,13 +468,17 @@ fn start_event_preprocessor(preprocess_rx: Receiver<KeyEvent>, process_tx: Sende
                                     KeyEvent::new(OsCode::KEY_LEFTCTRL, KeyValue::Release),
                                 );
                                 lctl_state = LctlState::None;
+                                NoMustPeriodicPoll
                             }
-                            _ => {}
+                            _ => YesCanBlock,
                         }
-                    }
+                    } else {
+                        YesCanBlock
+                    };
                     std::thread::sleep(time::Duration::from_millis(1));
+                    can_block
                 }
-                Err(TryRecvError::Disconnected) => {
+                Disconnected => {
                     panic!("channel disconnected")
                 }
             }

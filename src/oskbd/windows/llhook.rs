@@ -8,6 +8,9 @@
     allow(dead_code, unused_imports, unused_variables, unused_mut)
 )]
 
+mod mouse;
+pub use mouse::*;
+
 use core::fmt;
 use std::cell::Cell;
 use std::io;
@@ -108,7 +111,9 @@ impl InputEvent {
                 } else {
                     0
                 };
-                crate::oskbd::u16_to_osc((lparam.scanCode as u16) | extended)
+                let sc_with_ext = (lparam.scanCode as u16) | extended;
+                log::debug!("converting {sc_with_ext}");
+                crate::oskbd::u16_to_osc(sc_with_ext)
                     .map(Into::into)
                     .unwrap_or(lparam.vkCode)
             }
@@ -130,13 +135,13 @@ impl InputEvent {
 impl TryFrom<InputEvent> for KeyEvent {
     type Error = ();
     fn try_from(item: InputEvent) -> Result<Self, Self::Error> {
-        Ok(Self {
-            code: OsCode::from_u16(item.code as u16).ok_or(())?,
-            value: match item.up {
+        Ok(Self::new(
+            OsCode::from_u16(item.code as u16).ok_or(())?,
+            match item.up {
                 true => KeyValue::Release,
                 false => KeyValue::Press,
             },
-        })
+        ))
     }
 }
 

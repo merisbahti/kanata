@@ -35,3 +35,109 @@ fn sim_switch_base_layer() {
     .no_time();
     assert_eq!("out:↓X out:↑X out:↓Y out:↑Y out:↓Y out:↑Y", result);
 }
+
+#[test]
+fn sim_switch_noop() {
+    let result = simulate(
+        "
+         (defsrc)
+         (deflayermap (-) a XX b (switch
+          ((input real a)) c break
+          () d break
+         ))
+        ",
+        "d:a d:b t:10 u:a u:b t:10 d:b u:b t:10",
+    )
+    .no_time();
+    assert_eq!("out:↓C out:↑C out:↓D out:↑D", result);
+}
+
+#[test]
+fn sim_switch_trans_not_top_layer() {
+    let result = simulate(
+        "
+        (defalias init (multi (layer-while-held l1) (layer-while-held l2) (layer-while-held l3) (layer-while-held l4)))
+        (defsrc a b)
+        (deflayer l0 c @init)
+        (deflayer l1 b @init)
+        (deflayer l2 (switch () _ break) @init)
+        (deflayer l3 _ @init)
+        (deflayer l4 _ @init)
+        ",
+        "d:b t:20 d:a t:10 u:a t:100 d:a t:10 u:a t:100",
+    )
+    .to_ascii();
+    assert_eq!("t:20ms dn:B t:10ms up:B t:100ms dn:B t:10ms up:B", result);
+}
+
+#[test]
+fn sim_switch_not_logic() {
+    let result = simulate(
+        "
+        (defsrc a)
+        (deflayer base
+          (switch
+            ((or (not (or b)) b)) x break
+            () y break))
+        ",
+        "d:a t:10 u:a t:10",
+    )
+    .to_ascii();
+    assert_eq!("dn:X t:10ms up:X", result);
+    let result = simulate(
+        "
+        (defsrc a)
+        (deflayer base
+          (switch
+            ((or (not b) b)) x break
+            () y break))
+        ",
+        "d:a t:10 u:a t:10",
+    )
+    .to_ascii();
+    assert_eq!("dn:X t:10ms up:X", result);
+}
+
+/// The configuration guide recommends naming device IDs with `defvar`, so `definputdevices` has
+/// to resolve variables the same way `device-history` does.
+#[test]
+fn definputdevices_accepts_variables() {
+    let result = simulate(
+        r#"(defvar
+             id-internal 1
+             kbd-name "Apple Internal Keyboard"
+           )
+           (definputdevices
+             $id-internal ((name $kbd-name))
+           )
+           (defsrc a)
+           (deflayer base
+             (switch ((device-history $id-internal 1)) x break () a break))"#,
+        "d:a t:10 u:a t:10",
+    )
+    .to_ascii();
+    assert_eq!("dn:A t:10ms up:A", result);
+}
+
+#[test]
+fn switch_input_does_not_match_released_oneshot() {
+    let result = simulate(
+        "
+        (defsrc a b c)
+        (deflayer l
+          (one-shot 200 nop0)
+          (switch
+            ((input real a)) b break
+            ((input real c)) d break
+            () c break
+          )
+          (one-shot 200 (layer-while-held l2))
+        )
+        (deflayermap l2)
+        ",
+        "d:a t:50 u:a t:50 d:b t:50 u:b t:50 \n\
+         d:c t:50 u:c t:50 d:b t:50 u:b t:50",
+    )
+    .to_ascii();
+    assert_eq!("t:100ms dn:C t:50ms up:C t:150ms dn:C t:50ms up:C", result);
+}

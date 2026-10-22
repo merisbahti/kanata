@@ -197,7 +197,7 @@ impl LogFmt {
         };
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn write_raw(&mut self, event: InputEvent) {
         let key_name = KeyCode::from(OsCode::from(event.code));
         if event.up {
@@ -348,11 +348,11 @@ impl KbdOut {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub fn new() -> Result<Self, io::Error> {
         Self::new_actual()
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn new(
         _s: &Option<String>,
         _tp: bool,
@@ -361,7 +361,7 @@ impl KbdOut {
     ) -> Result<Self, io::Error> {
         Self::new_actual()
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn write_raw(&mut self, event: InputEvent) -> Result<(), io::Error> {
         self.log.write_raw(event);
         self.outputs.push(format!("out-raw:{event:?}"));
@@ -370,6 +370,12 @@ impl KbdOut {
     pub fn write(&mut self, event: InputEvent) -> Result<(), io::Error> {
         self.outputs.push(format!("out:{event}"));
         Ok(())
+    }
+    pub fn output_ready(&self) -> bool {
+        true
+    }
+    pub fn wait_until_ready(&self, _timeout: Option<std::time::Duration>) -> bool {
+        true
     }
     pub fn write_key(&mut self, key: OsCode, value: KeyValue) -> Result<(), io::Error> {
         let key_ev = KeyEvent::new(key, value);
@@ -398,6 +404,7 @@ impl KbdOut {
         self.log.release_key(key);
         self.write_key(key, KeyValue::Release)
     }
+    pub fn release_tracked_output_keys(&mut self, _reason: &str) {}
     pub fn send_unicode(&mut self, c: char) -> Result<(), io::Error> {
         self.log.send_unicode(c);
         self.outputs.push(format!("outU:{c}"));
@@ -450,10 +457,10 @@ impl KbdOut {
 #[derive(Debug, Clone, Copy)]
 pub struct InputEvent {
     pub code: u32,
-
     /// Key was released
     pub up: bool,
 }
+
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 impl fmt::Display for InputEvent {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -477,13 +484,13 @@ impl InputEvent {
 impl TryFrom<InputEvent> for KeyEvent {
     type Error = ();
     fn try_from(item: InputEvent) -> Result<Self, Self::Error> {
-        Ok(Self {
-            code: OsCode::from_u16(item.code as u16).ok_or(())?,
-            value: match item.up {
+        Ok(Self::new(
+            OsCode::from_u16(item.code as u16).ok_or(())?,
+            match item.up {
                 true => KeyValue::Release,
                 false => KeyValue::Press,
             },
-        })
+        ))
     }
 }
 

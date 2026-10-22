@@ -7,6 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 
 mod ambiguous;
 mod defcfg;
+mod defgamepad;
+mod defhands;
 mod device_detect;
 mod environment;
 mod macros;
@@ -29,7 +31,7 @@ fn init_log() {
             LevelFilter::Error,
             log_cfg.build(),
             TerminalMode::Stderr,
-            ColorChoice::AlwaysAnsi,
+            ColorChoice::Auto,
         )])
         .expect("logger can init");
     });
@@ -62,10 +64,39 @@ fn parse_cfg(cfg: &str) -> Result<IntermediateCfg> {
                 .iter()
                 .all(|action| *action != DEFAULT_ACTION)
         }));
-        #[cfg(any(target_os = "linux", target_os = "unknown"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "unknown"))]
         assert!(icfg.options.linux_opts.linux_device_detect_mode.is_some());
     }
     icfg
+}
+
+#[test]
+fn definputdevices_trims_quoted_matcher_values() {
+    let _lk = lock(&CFG_PARSE_LOCK);
+    // Quoted names must lose syntax quotes; the hash case also verifies quoted
+    // hex parsing.
+    let cfg = new_from_str(
+        r#"(defcfg)
+            (defsrc a)
+            (deflayer base a)
+            (definputdevices
+              1 ((name "Apple Internal Keyboard / Trackpad"))
+              2 ((name "silakka54") (vendor_id 0xFEED) (product_id 0x1212))
+              3 ((hash "E328037D977386DE")))"#,
+        HashMap::default(),
+    )
+    .expect("quoted device matchers should parse");
+    let devices = cfg
+        .input_devices
+        .expect("definputdevices should be retained");
+    assert_eq!(
+        devices[0].1.name.as_deref(),
+        Some("Apple Internal Keyboard / Trackpad")
+    );
+    assert_eq!(devices[1].1.name.as_deref(), Some("silakka54"));
+    assert_eq!(devices[1].1.vendor_id, Some(0xFEED));
+    assert_eq!(devices[1].1.product_id, Some(0x1212));
+    assert_eq!(devices[2].1.hash.as_deref(), Some("e328037d977386de"));
 }
 
 #[test]
@@ -74,6 +105,68 @@ fn sizeof_action_is_two_usizes() {
         std::mem::size_of::<KanataAction>(),
         std::mem::size_of::<usize>() * 2
     );
+}
+
+#[test]
+fn emits_mouse_buttons_detects_in_layer_actions() {
+    let _lk = lock(&CFG_PARSE_LOCK);
+    // A mouse button output (`mlft`/`mrgt`/… and `-tap` forms) should flip the
+    // flag, plain or nested inside another action, including inside a macro
+    // (stored as a Sequence, which the flag catches at parse time).
+    for (name, action) in [
+        ("plain", "mlft"),
+        ("tap-variant", "mltp"),
+        ("multi", "(multi a mlft)"),
+        ("tap-hold", "(tap-hold 200 200 a mlft)"),
+        ("fork", "(fork a mmid (lctl))"),
+        ("macro", "(macro mlft)"),
+    ] {
+        let src = format!("(defsrc a)\n(deflayer base {action})");
+        let cfg = new_from_str(&src, HashMap::default())
+            .unwrap_or_else(|e| panic!("{name} config should parse: {e:?}"));
+        assert!(
+            cfg.emits_mouse_buttons,
+            "{name}: expected emits_mouse_buttons = true"
+        );
+    }
+}
+
+#[test]
+fn emits_mouse_buttons_detects_outside_layers() {
+    let _lk = lock(&CFG_PARSE_LOCK);
+    // The mouse button lives only in a virtual key, not on any layer key.
+    let vkey = "(defsrc a)\n(deflayer base (on-press-fakekey mymouse press))\n\
+                (defvirtualkeys mymouse mlft)";
+    // The mouse button lives only in an alias used solely as the on-load action.
+    let on_load = "(defcfg alias-to-trigger-on-load startmouse)\n(defsrc a)\n\
+                   (deflayer base a)\n(defalias startmouse mlft)";
+    for (name, src) in [("virtual-key", vkey), ("on-load-alias", on_load)] {
+        let cfg = new_from_str(src, HashMap::default())
+            .unwrap_or_else(|e| panic!("{name} config should parse: {e:?}"));
+        assert!(
+            cfg.emits_mouse_buttons,
+            "{name}: expected emits_mouse_buttons = true"
+        );
+    }
+}
+
+#[test]
+fn emits_mouse_buttons_false_without_mouse_button_output() {
+    let _lk = lock(&CFG_PARSE_LOCK);
+    // Plain keys, mouse *wheel* and mouse *movement* are not mouse buttons.
+    for (name, action) in [
+        ("plain-key", "b"),
+        ("mwheel", "(mwheel-up 50 120)"),
+        ("movemouse", "(movemouse-up 1 1)"),
+    ] {
+        let src = format!("(defsrc a)\n(deflayer base {action})");
+        let cfg = new_from_str(&src, HashMap::default())
+            .unwrap_or_else(|e| panic!("{name} config should parse: {e:?}"));
+        assert!(
+            !cfg.emits_mouse_buttons,
+            "{name}: expected emits_mouse_buttons = false"
+        );
+    }
 }
 
 #[test]
@@ -239,9 +332,11 @@ fn parse_action_vars() {
   tht (tap-hold-release-timeout $one $two $chr $two $one)
   thk (tap-hold-release-keys $one $two $chr $two $three)
   the (tap-hold-except-keys $one $two $chr $two $three)
+  thtt (tap-hold-tap-keys $one $two $chr $two $three)
   thta (tap⬓↑timeout $one $two $chr $two $one)
   thka (tap⬓↑keys $one $two $chr $two $three)
   thea (tap⬓⤫keys $one $two $chr $two $three)
+  thtta (tap⬓tapkeys $one $two $chr $two $three)
   mac (macro $one $two $one $two $chr C-S-$three $one)
   rmc (macro-repeat $one $two $one $two $chr C-S-$three $one)
   mrca (macro↑⤫ $one 500 bspc S-1 500 bspc S-2)
@@ -333,6 +428,22 @@ fn parse_zippychord_file() {
 }
 
 #[test]
+#[cfg(feature = "zippychord")]
+fn reject_invalid_zippy_output_mapping_arity() {
+    let _lk = lock(&CFG_PARSE_LOCK);
+    let zippy_file: HashMap<String, String> = [("zippy.txt".to_owned(), "ab\tab".to_owned())]
+        .into_iter()
+        .collect();
+
+    for mapping in ["(no-erase)", "(no-erase a b)", "(single-output)"] {
+        let cfg = format!(
+            "(defsrc)\n(deflayer base)\n(defzippy zippy.txt output-character-mappings (a {mapping}))"
+        );
+        assert!(new_from_str(&cfg, zippy_file.clone()).is_err());
+    }
+}
+
+#[test]
 fn disallow_nested_tap_hold() {
     let _lk = lock(&CFG_PARSE_LOCK);
     match new_from_file(&std::path::PathBuf::from("./test_cfgs/nested_tap_hold.kbd"))
@@ -397,6 +508,80 @@ fn unknown_defcfg_item_fails() {
 }
 
 #[test]
+fn parse_distance_rejects_out_of_range() {
+    // Regression: the 1..=30000 range promised by the error message must be
+    // enforced for movemouse/mwheel distances. A clippy cleanup (f3488c4)
+    // previously dropped the range guard while keeping the message, so 0 and
+    // 30001..=65535 were silently accepted.
+    for distance in ["0", "30001", "65535"] {
+        let source = format!(
+            r#"(defsrc a)
+(deflayer base (movemouse-up 1 {distance}))
+"#
+        );
+        let err = parse_cfg(&source).expect_err("out-of-range distance should be rejected");
+        assert!(
+            err.msg.contains("distance must be 1-30000"),
+            "distance {distance}: real e: {}",
+            err.msg
+        );
+    }
+
+    // mwheel shares parse_distance.
+    let source = r#"(defsrc a)
+(deflayer base (mwheel-up 1 0))
+"#;
+    let err = parse_cfg(source).expect_err("zero mwheel distance should be rejected");
+    assert!(
+        err.msg.contains("distance must be 1-30000"),
+        "real e: {}",
+        err.msg
+    );
+
+    // movemouse-accel min/max distances flow through parse_distance too.
+    let source = r#"(defsrc a)
+(deflayer base (movemouse-accel-up 1 1 0 5))
+"#;
+    let err = parse_cfg(source).expect_err("zero min distance should be rejected");
+    assert!(err.msg.contains("min distance must be 1-30000"));
+
+    // Boundary values 1 and 30000 are valid.
+    for distance in ["1", "30000"] {
+        let source = format!(
+            r#"(defsrc a)
+(deflayer base (movemouse-up 1 {distance}))
+"#
+        );
+        parse_cfg(&source)
+            .map_err(|e| eprintln!("{:?}", miette::Error::from(e)))
+            .expect("in-range distance should parse");
+    }
+}
+
+#[test]
+fn parse_mousewheel_speed() {
+    parse_cfg("(defsrc a) (deflayer base (mousewheel-speed 50))")
+        .map_err(|e| eprintln!("{:?}", miette::Error::from(e)))
+        .expect("valid speed should parse");
+    for (action, msg) in [
+        (
+            "(mousewheel-speed)",
+            "mousewheel-speed expects one parameter, found 0",
+        ),
+        (
+            "(mousewheel-speed 50 50)",
+            "mousewheel-speed expects one parameter, found 2",
+        ),
+        ("(mousewheel-speed 0)", "speed scaling % must be 1-65535"),
+        ("(mousewheel-speed fast)", "speed scaling % must be 1-65535"),
+    ] {
+        let err = parse_cfg(&format!("(defsrc a) (deflayer base {action})"))
+            .expect_err("invalid mousewheel-speed should be rejected");
+        assert!(err.msg.contains(msg), "{action}: real e: {}", err.msg);
+    }
+}
+
+#[test]
 fn recursive_multi_is_flattened() {
     macro_rules! atom {
         ($e:expr) => {
@@ -421,19 +606,21 @@ fn recursive_multi_is_flattened() {
     ];
     let s = ParserState::default();
     if let KanataAction::MultipleActions(parsed_multi) = parse_multi(&params, &s).unwrap() {
-        assert_eq!(parsed_multi.len(), 4);
+        assert_eq!(parsed_multi.len(), 6);
         assert_eq!(parsed_multi[0], Action::KeyCode(KeyCode::A));
-        assert_eq!(parsed_multi[1], Action::KeyCode(KeyCode::B));
-        assert_eq!(parsed_multi[2], Action::KeyCode(KeyCode::C));
+        assert_eq!(parsed_multi[2], Action::KeyCode(KeyCode::B));
+        assert_eq!(parsed_multi[4], Action::KeyCode(KeyCode::C));
+        assert_eq!(
+            parsed_multi[1],
+            Action::Custom(&CustomAction::MouseTap(Btn::Mid))
+        );
         assert_eq!(
             parsed_multi[3],
-            Action::Custom(
-                &&[
-                    &CustomAction::MouseTap(Btn::Mid),
-                    &CustomAction::MouseTap(Btn::Left),
-                    &CustomAction::MouseTap(Btn::Right),
-                ][..]
-            )
+            Action::Custom(&CustomAction::MouseTap(Btn::Left))
+        );
+        assert_eq!(
+            parsed_multi[5],
+            Action::Custom(&CustomAction::MouseTap(Btn::Right))
         );
     } else {
         panic!("multi did not parse into multi");
@@ -851,7 +1038,9 @@ fn parse_switch() {
                     &Action::KeyCode(KeyCode::A),
                     BreakOrFallthrough::Break
                 ),
-            ]
+            ],
+            init_fn: None,
+            callbacks: &[],
         })
     );
 }
@@ -932,43 +1121,31 @@ fn parse_virtualkeys() {
     let (klayers, _) = res.klayers.get();
     assert_eq!(
         klayers[0][0][OsCode::KEY_A.as_u16() as usize],
-        Action::Custom(
-            &[&CustomAction::FakeKey {
-                coord: Coord { x: 1, y: 0 },
-                action: FakeKeyAction::Press,
-            }]
-            .as_ref()
-        ),
+        Action::Custom(&CustomAction::FakeKey {
+            coord: Coord { x: 1, y: 0 },
+            action: FakeKeyAction::Press,
+        }),
     );
     assert_eq!(
         klayers[0][0][OsCode::KEY_F.as_u16() as usize],
-        Action::Custom(
-            &[&CustomAction::FakeKey {
-                coord: Coord { x: 1, y: 1 },
-                action: FakeKeyAction::Release,
-            }]
-            .as_ref()
-        ),
+        Action::Custom(&CustomAction::FakeKey {
+            coord: Coord { x: 1, y: 1 },
+            action: FakeKeyAction::Release,
+        }),
     );
     assert_eq!(
         klayers[0][0][OsCode::KEY_K.as_u16() as usize],
-        Action::Custom(
-            &[&CustomAction::FakeKeyOnRelease {
-                coord: Coord { x: 1, y: 0 },
-                action: FakeKeyAction::Toggle,
-            }]
-            .as_ref()
-        ),
+        Action::Custom(&CustomAction::FakeKeyOnRelease {
+            coord: Coord { x: 1, y: 0 },
+            action: FakeKeyAction::Toggle,
+        }),
     );
     assert_eq!(
         klayers[0][0][OsCode::KEY_P.as_u16() as usize],
-        Action::Custom(
-            &[&CustomAction::FakeKeyOnRelease {
-                coord: Coord { x: 1, y: 1 },
-                action: FakeKeyAction::Tap,
-            }]
-            .as_ref()
-        ),
+        Action::Custom(&CustomAction::FakeKeyOnRelease {
+            coord: Coord { x: 1, y: 1 },
+            action: FakeKeyAction::Tap,
+        }),
     );
 }
 
@@ -997,14 +1174,11 @@ fn parse_on_idle_fakekey() {
     let (klayers, _) = res.klayers.get();
     assert_eq!(
         klayers[0][0][OsCode::KEY_A.as_u16() as usize],
-        Action::Custom(
-            &[&CustomAction::FakeKeyOnIdle(FakeKeyOnIdle {
-                coord: Coord { x: 1, y: 0 },
-                action: FakeKeyAction::Tap,
-                idle_duration: 200
-            })]
-            .as_ref()
-        ),
+        Action::Custom(&CustomAction::FakeKeyOnIdle(FakeKeyOnIdle {
+            coord: Coord { x: 1, y: 0 },
+            action: FakeKeyAction::Tap,
+            idle_duration: 200
+        })),
     );
 }
 
@@ -1254,6 +1428,37 @@ new 316
 }
 
 #[test]
+fn deflocalkeys_non_applicable_variant_consumes_value() {
+    // Regression: a non-applicable deflocalkeys-* variant must still consume
+    // each key's paired value. Previously the non-applicable branch did
+    // `insert` + `continue` without advancing the iterator, so a value that
+    // collided with a later key name was read back as a key and tripped a
+    // spurious "Duplicate" error — a config valid on its target OS failed to
+    // parse on every other OS.
+    let non_applicable = DEFLOCALKEYS_VARIANTS
+        .iter()
+        .copied()
+        .find(|v| !deflocalkeys_variant_applies_to_current_os(v))
+        .expect("there are multiple variants, so at least one is non-applicable");
+
+    // The value `2` for key `1` collides with the next declared key `2`.
+    // On the variant's target OS this maps 1->2, 2->3 and parses fine; on
+    // every other OS it must parse fine too, not error with "Duplicate 2".
+    let source = format!(
+        r#"({non_applicable}
+  1 2
+  2 3
+)
+(defsrc 1 2)
+(deflayer base a b)
+"#
+    );
+    parse_cfg(&source)
+        .map_err(|e| eprintln!("{:?}", miette::Error::from(e)))
+        .expect("non-applicable deflocalkeys variant must not spuriously reject");
+}
+
+#[test]
 fn use_default_overridable_mappings() {
     let source = r#"
 (defsrc + [  ]  a  b  /  ;  `  =  -  '  ,  .  9  yen ¥  )
@@ -1304,7 +1509,7 @@ fn parse_device_paths() {
 }
 
 #[test]
-#[cfg(any(target_os = "linux", target_os = "unknown"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "unknown"))]
 fn test_parse_dev() {
     // The old colon separated devices format
     assert_eq!(
@@ -1383,6 +1588,7 @@ fn parse_all_defcfg() {
   sequence-input-mode visible-backspaced
   sequence-backtrack-modcancel no
   log-layer-changes no
+  log-layer-changes-name-only no
   delegate-to-first-layer yes
   movemouse-inherit-accel-state yes
   movemouse-smooth-diagonals yes
@@ -2096,6 +2302,35 @@ fn reverse_release_order_must_be_within_multi() {
 }
 
 #[test]
+fn bare_sym_prefix_errors_without_panic() {
+    // A bare 🔣 atom (SYM prefix with no character following) must yield a
+    // graceful parse error rather than panicking inside the unisym handling
+    // (the old code did `unisym.chars().next().expect("1 char")`).
+    let source = "
+(defsrc a)
+(deflayer base 🔣)
+";
+    let err = parse_cfg(source).expect_err("bare 🔣 must be a parse error, not a panic");
+    assert!(
+        err.msg.contains('🔣'),
+        "unexpected error message: {}",
+        err.msg
+    );
+}
+
+#[test]
+fn inline_sym_prefix_unicode_parses() {
+    // The inline `🔣X` atom form should still parse to a unicode action.
+    let source = "
+(defsrc a)
+(deflayer base 🔣a)
+";
+    parse_cfg(source)
+        .map_err(|e| eprintln!("{:?}", miette::Error::from(e)))
+        .expect("🔣a should parse as a unicode action");
+}
+
+#[test]
 fn parse_clipboard_actions() {
     let source = "
 (defsrc)
@@ -2107,4 +2342,115 @@ fn parse_clipboard_actions() {
 )
 ";
     parse_cfg(source).map(|_| ()).expect("success");
+}
+
+/// `mouse-movement-key` parses on every platform that supports the feature
+/// (Linux, Android, macOS, Windows-interception, unknown). Regression guard
+/// for the macOS cfg gate previously omitting `target_os = "macos"`, which
+/// caused the option to fail with "Unknown defcfg option" on macOS.
+#[cfg(any(
+    all(target_os = "windows", feature = "interception_driver"),
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "unknown"
+))]
+#[test]
+fn parse_mouse_movement_key() {
+    let source = "
+(defcfg
+  process-unmapped-keys yes
+  mouse-movement-key mvmt
+)
+(defsrc a mvmt)
+(deflayer base a _)
+";
+    let icfg = parse_cfg(source).expect("parses");
+    assert_eq!(
+        icfg.options.mouse_movement_key,
+        Some(crate::keys::OsCode::KEY_766),
+    );
+}
+
+/// Regression guard for the hwid length fencepost in `sexpr_to_hwids_vec`.
+///
+/// Bytes parsed from a hwid are packed into a fixed `[u8; HWID_ARR_SZ]` array.
+/// The bounds check must reject an over-long hwid with a clean "too long" error
+/// instead of indexing out of bounds and panicking. Valid indices are
+/// `0..HWID_ARR_SZ`, so the guard compares `i >= HWID_ARR_SZ` (not `>`): the
+/// first index equal to the array length is already out of bounds and must be
+/// rejected *before* the `hwid[i] = b` assignment.
+#[cfg(any(
+    all(target_os = "windows", feature = "interception_driver"),
+    target_os = "unknown"
+))]
+#[test]
+fn wintercept_hwids_reject_overlong_cleanly() {
+    use crate::cfg::sexpr::{SExpr, Span, Spanned};
+
+    fn hwids_expr(hwid: String) -> SExpr {
+        SExpr::List(Spanned::new(
+            vec![SExpr::Atom(Spanned::new(hwid, Span::default()))],
+            Span::default(),
+        ))
+    }
+
+    let label = "windows-interception-mouse-hwids";
+    let entry_label = "entry in windows-interception-mouse-hwids";
+
+    // Exactly HWID_ARR_SZ bytes fit (indices 0..HWID_ARR_SZ).
+    let exact = vec!["0"; HWID_ARR_SZ].join(",");
+    super::defcfg::sexpr_to_hwids_vec(&hwids_expr(exact), label, entry_label)
+        .expect("hwid of exactly HWID_ARR_SZ bytes should parse");
+
+    // A short hwid parses fine.
+    super::defcfg::sexpr_to_hwids_vec(&hwids_expr("1, 2, 3".to_string()), label, entry_label)
+        .expect("short hwid should parse");
+
+    // One byte past the limit must be a clean error, not an index-out-of-bounds panic.
+    let overlong = vec!["0"; HWID_ARR_SZ + 1].join(",");
+    let err = super::defcfg::sexpr_to_hwids_vec(&hwids_expr(overlong), label, entry_label)
+        .expect_err("over-long hwid should be rejected");
+    assert!(
+        err.msg.contains("too long"),
+        "expected a 'too long' error, got: {}",
+        err.msg
+    );
+}
+
+/// Regression guard for the singular `windows-interception-mouse-hwid` path, whose
+/// inline array-bounds check shares the same fencepost as `sexpr_to_hwids_vec`.
+#[cfg(any(
+    all(target_os = "windows", feature = "interception_driver"),
+    target_os = "unknown"
+))]
+#[test]
+fn parse_defcfg_wintercept_mouse_hwid_rejects_overlong() {
+    // One byte past the limit must be a clean error, not an index-out-of-bounds panic.
+    let overlong = vec!["0"; HWID_ARR_SZ + 1].join(",");
+    let source = format!(
+        "
+(defcfg
+  windows-interception-mouse-hwid \"{overlong}\"
+)
+(defsrc a)
+(deflayer base a)
+"
+    );
+    let err = parse_cfg(&source).expect_err("over-long hwid should be rejected");
+    assert!(
+        err.msg.contains("too long"),
+        "expected a 'too long' error, got: {}",
+        err.msg
+    );
+
+    // A short hwid still parses.
+    let source = "
+(defcfg
+  windows-interception-mouse-hwid \"70, 0, 60, 0\"
+)
+(defsrc a)
+(deflayer base a)
+";
+    parse_cfg(source).expect("short hwid should parse");
 }

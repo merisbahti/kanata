@@ -25,7 +25,7 @@ fn cli_init() -> Result<ValidatedArgs> {
                         LevelFilter::Debug,
                         log_cfg.build(),
                         TerminalMode::Mixed,
-                        ColorChoice::AlwaysAnsi,
+                        ColorChoice::Auto,
                     ),
                     log_win::windbg_simple_combo(LevelFilter::Debug, noti_lvl),
                 ])
@@ -69,6 +69,14 @@ fn cli_init() -> Result<ValidatedArgs> {
         }
     };
 
+    #[cfg(feature = "interception_driver")]
+    {
+        if args.list {
+            super::list_devices_windows();
+            std::process::exit(0);
+        }
+    }
+
     let cfg_paths = args.cfg.unwrap_or_else(default_cfg);
 
     let log_lvl = match (args.debug, args.trace) {
@@ -91,7 +99,7 @@ fn cli_init() -> Result<ValidatedArgs> {
                 log_lvl,
                 log_cfg.build(),
                 TerminalMode::Mixed,
-                ColorChoice::AlwaysAnsi,
+                ColorChoice::Auto,
             ),
             log_win::windbg_simple_combo(log_lvl, noti_lvl),
         ])
@@ -197,6 +205,8 @@ fn main_impl() -> Result<()> {
         warn!("Someone else set our ‘GUI_EXIT_TX’");
     };
     Kanata::start_processing_loop(kanata_arc.clone(), rx, ntx, args.nodelay);
+
+    Kanata::start_gamepad_handling_if_configured(&kanata_arc, tx.clone());
 
     if let (Some(server), Some(nrx)) = (server, nrx) {
         #[allow(clippy::unit_arg)]

@@ -31,13 +31,20 @@ sha256sums output_dir:
   cd {{output_dir}}; sha256sum * > sha256sums
 
 test:
-  cargo test -p kanata -p kanata-parser -p kanata-keyberon -- --nocapture
+  cargo fmt --all --check
+  cargo test -p kanata -p kanata-parser -p kanata-keyberon -p kanata-wasm -p kanata-tcp-protocol -- --nocapture
   cargo test --features=simulated_output sim_tests
   cargo test --features=simulated_output -- must_be_single_threaded --ignored --test-threads=1
   cargo clippy --all
 
 fmt:
   cargo fmt --all
+
+[doc('Run fmt, check, and clippy')]
+check:
+  cargo fmt --all
+  cargo check
+  cargo clippy --all
 
 guic:
   cargo check              --features=gui
@@ -55,6 +62,10 @@ change_subcrate_versions version:
   sed -i 's/^version = ".*"$/version = "{{version}}"/' parser/Cargo.toml tcp_protocol/Cargo.toml keyberon/Cargo.toml
   sed -i 's/^\(#\? \?kanata-\(keyberon\|parser\|tcp-protocol\).*version\) = "[0-9.]*"/\1 = "{{version}}"/' Cargo.toml parser/Cargo.toml
 
+change_subcrate_versions_pwsh version:
+  $files = "parser/Cargo.toml", "tcp_protocol/Cargo.toml", "keyberon/Cargo.toml"; foreach ($f in $files) { (Get-Content $f) -replace '^version = ".*"$', 'version = "{{version}}"' | Set-Content $f }
+  $files = "Cargo.toml", "parser/Cargo.toml"; $pattern = '^(#?\s?kanata-(keyberon|parser|tcp-protocol).*version) = "[0-9.]*"'; $replacement = '$1 = "{{version}}"'; foreach ($f in $files) { (Get-Content $f) -replace $pattern, $replacement | Set-Content $f }
+
 cov:
   cargo llvm-cov clean --workspace
   cargo llvm-cov --no-report --workspace --no-default-features
@@ -65,9 +76,9 @@ cov:
   cargo llvm-cov report --html
 
 publish:
-  cd keyberon && cargo publish
-  cd tcp_protocol && cargo publish
-  cd parser && cargo publish
+  cd keyberon; cargo publish
+  cd tcp_protocol; cargo publish
+  cd parser; cargo publish
   cargo publish
 
 # Include the trailing `\` or `/` in the output_dir parameter. The parameter should be an absolute path.
@@ -75,14 +86,17 @@ cfg_to_html output_dir:
   cd docs ; asciidoctor config.adoc
   cd docs ; cp config.html "{{output_dir}}config.html"; rm config.html
 
-# Include the trailing `\` or `/` in the output_dir parameter. The parameter should be an absolute path.
+[doc('Deprecated. The wasm-pack project is no longer maintained; prefer wasm-build instead.
+Include the trailing `\` or `/` in the output_dir parameter. The parameter should be an absolute path.
+')]
 wasm_pack output_dir:
   cd wasm; wasm-pack build --target web; cd pkg; cp kanata_wasm_bg.wasm "{{output_dir}}"; cp kanata_wasm.js "{{output_dir}}"
 
+[doc('Include the trailing `\` or `/` in the output_dir parameter. The parameter should be an absolute path.')]
 wasm-build output_dir:
   cd wasm; echo "*" > pkg/.gitignore
   cd wasm; cargo build --lib --release --target wasm32-unknown-unknown
-  cd wasm; wasm-bindgen target/wasm32-unknown-unknown/release/kanata_wasm.wasm --out-dir pkg --typescript --target web
+  cd wasm; wasm-bindgen ../target/wasm32-unknown-unknown/release/kanata_wasm.wasm --out-dir pkg --typescript --target web
   wasm-opt wasm/pkg/kanata_wasm_bg.wasm -o wasm/pkg/kanata_wasm.wasm-opt.wasm -Oz
   rm wasm/pkg/kanata_wasm_bg.wasm
   mv wasm/pkg/kanata_wasm.wasm-opt.wasm wasm/pkg/kanata_wasm_bg.wasm

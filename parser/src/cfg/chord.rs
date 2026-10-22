@@ -1,4 +1,3 @@
-use itertools::Itertools;
 use kanata_keyberon::chord::{ChordV2, ChordsForKey, ChordsForKeys, ReleaseBehaviour};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -19,7 +18,7 @@ pub(crate) fn parse_defchordv2(
         );
     }
 
-    let mut chunks = exprs[1..].chunks_exact(5);
+    let chunks = exprs[1..].as_chunks::<5>();
     let mut chords_container = ChordsForKeys::<'static, KanataCustom> {
         mapping: FxHashMap::default(),
     };
@@ -27,7 +26,8 @@ pub(crate) fn parse_defchordv2(
     let mut all_participating_key_sets = FxHashSet::default();
 
     let all_chords = chunks
-        .by_ref()
+        .0
+        .iter()
         .flat_map(|chunk| match chunk[0] {
             // Match a line like
             // (include filename.txt) () 100 all-released (layer1 layer2)
@@ -48,7 +48,7 @@ pub(crate) fn parse_defchordv2(
                     let chunk = chord_translation.translate_chord(chord_def);
                     parse_single_chord(&chunk, s, &mut all_participating_key_sets)
                 });
-                Ok::<_, ParseError>(processed.collect_vec())
+                Ok::<_, ParseError>(processed.collect::<Vec<_>>())
             }
             _ => Ok(vec![parse_single_chord(
                 chunk,
@@ -66,19 +66,21 @@ pub(crate) fn parse_defchordv2(
         return Err((*e).clone());
     }
 
-    let successful = all_chords.into_iter().filter_map(Result::ok).collect_vec();
+    let successful = all_chords
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
     for chord in successful {
         for pkey in chord.participating_keys.iter().copied() {
-            //log::trace!("chord for key:{pkey:?} > {chord:?}");
             chords_container
                 .mapping
                 .entry(pkey)
                 .or_insert(ChordsForKey { chords: vec![] })
                 .chords
-                .push(s.a.sref(chord.clone()));
+                .push(chord);
         }
     }
-    let rem = chunks.remainder();
+    let rem = chunks.1;
     if !rem.is_empty() {
         bail_expr!(
             rem.last().unwrap(),
@@ -93,7 +95,7 @@ fn parse_single_chord(
     chunk: &[SExpr],
     s: &ParserState,
     all_participating_key_sets: &mut FxHashSet<Vec<u16>>,
-) -> Result<ChordV2<'static, KanataCustom>> {
+) -> Result<&'static ChordV2<'static, KanataCustom>> {
     let participants = parse_participating_keys(&chunk[0], s)?;
     if !all_participating_key_sets.insert(participants.clone()) {
         bail_expr!(
@@ -112,7 +114,7 @@ fn parse_single_chord(
         disabled_layers: s.a.sref_vec(disabled_layers),
         release_behaviour,
     };
-    Ok(s.a.sref(chord).clone())
+    Ok(s.a.sref(chord))
 }
 
 fn parse_participating_keys(keys: &SExpr, s: &ParserState) -> Result<Vec<u16>> {
@@ -237,7 +239,7 @@ impl<'a> ChordTranslation<'a> {
         timeout: &'a SExpr,
         release_behaviour: &'a SExpr,
         disabled_layers: &'a SExpr,
-        first_layer: &[Action<'static, &&[&CustomAction]>],
+        first_layer: &[Action<'static, KanataCustom>],
     ) -> Self {
         let postprocess_map: FxHashMap<String, String> = [
             ("semicolon", ";"),
@@ -308,7 +310,7 @@ impl<'a> ChordTranslation<'a> {
         let mut action_strings = action
             .chars()
             .map(|c| self.post_process(&c.to_string()))
-            .collect_vec();
+            .collect::<Vec<_>>();
         // Wait 50ms for one-shot Shift to release
         // TODO: This would be better handled by a (multi (release-key lsft)(release-key rsft))
         // but I haven't gotten that to work yet.

@@ -39,12 +39,43 @@ pub(super) fn run_cmd_in_thread(
         match cmd.output() {
             Ok(output) => {
                 if let Some(level) = log_level {
+                    let mut stdout = String::from_utf8_lossy(&output.stdout);
+                    let mut stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout_empty = stdout.is_empty();
+                    let stderr_empty = stderr.is_empty();
+                    let stdout_ends_in_newline = stdout.ends_with('\n');
+                    // log! provides us the final newline, so if we don't trim it from the last output,
+                    // we will see an extra blank line
+                    // that's why we're trying to figure out which output is the last one
+                    if !stderr_empty {
+                        if stderr.ends_with('\n') {
+                            // user might be intentionally printing blank lines, trimming more than one is overzealous
+                            stderr.to_mut().pop();
+                        }
+                    } else if !stdout_empty && stdout_ends_in_newline {
+                        stdout.to_mut().pop();
+                    }
+                    let stdout_announcer = if stdout_empty { "" } else { "stdout:\n" };
+                    let stderr_announcer = if stderr_empty {
+                        ""
+                    // we don't *re*-check whether stdout ends in a newline because the branch
+                    // that trims it out is unreachable if stderr is not empty
+                    } else if !stdout_empty && !stdout_ends_in_newline {
+                        "\nstderr:\n"
+                    } else {
+                        "stderr:\n"
+                    };
+                    let newline = if stdout_empty && stderr_empty {
+                        ""
+                    } else {
+                        "\n"
+                    };
                     log::log!(
                         level,
-                        "Successfully ran cmd: {}\nstdout:\n{}\nstderr:\n{}",
+                        "Successfully ran cmd: {}{newline}{stdout_announcer}{}{stderr_announcer}{}",
                         printable_cmd,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
+                        stdout,
+                        stderr,
                     );
                 };
             }
@@ -187,7 +218,7 @@ fn try_parse_chorded_list<'a>(
 }
 
 #[cfg(not(feature = "simulated_output"))]
-pub(super) fn keys_for_cmd_output(cmd_and_args: &[String]) -> impl Iterator<Item = Item> {
+pub(super) fn keys_for_cmd_output(cmd_and_args: &[&str]) -> impl Iterator<Item = Item> {
     let mut args = cmd_and_args.iter();
     let mut cmd = std::process::Command::new(
         args.next()
@@ -230,7 +261,7 @@ pub(super) fn keys_for_cmd_output(cmd_and_args: &[String]) -> impl Iterator<Item
 }
 
 #[cfg(feature = "simulated_output")]
-pub(super) fn keys_for_cmd_output(cmd_and_args: &[String]) -> impl Iterator<Item = Item> {
+pub(super) fn keys_for_cmd_output(cmd_and_args: &[&str]) -> impl Iterator<Item = Item> {
     println!("cmd-keys:{cmd_and_args:?}");
     [].iter().copied()
 }

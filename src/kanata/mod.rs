@@ -8,7 +8,58 @@ use log::{error, info};
 use parking_lot::Mutex;
 use std::sync::mpsc::{Receiver, SyncSender as Sender, TryRecvError};
 
-#[cfg(feature = "passthru_ahk")]
+/// Reorders events so modifiers are processed first on press, last on release.
+fn collect_and_sort_events(
+    first_event: KeyEvent,
+    rx: &Receiver<KeyEvent>,
+    events: &mut Vec<KeyEvent>,
+) {
+    events.clear();
+    events.push(first_event);
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    if events.len() > 1 {
+        log::debug!("collected {} events, reordering", events.len());
+        events.sort_by(|a, b| {
+            let a_is_mod = a.code.is_modifier();
+            let b_is_mod = b.code.is_modifier();
+            // Same modifier status: preserve original order
+            if a_is_mod == b_is_mod {
+                return std::cmp::Ordering::Equal;
+            }
+            let a_is_press = matches!(a.value, KeyValue::Press | KeyValue::Repeat);
+            let b_is_press = matches!(b.value, KeyValue::Press | KeyValue::Repeat);
+            // Different event types (press vs release): preserve original order
+            // to maintain valid total ordering
+            if a_is_press != b_is_press {
+                return std::cmp::Ordering::Equal;
+            }
+            // Same event type, different modifier status: reorder
+            if a_is_press {
+                // Press/Repeat: modifiers first
+                if a_is_mod {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            } else {
+                // Release: modifiers last
+                if a_is_mod {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+        });
+        log::debug!("reordered: {:?}", events);
+    }
+}
+
+#[cfg(any(
+    feature = "passthru_ahk",
+    all(feature = "simulated_input", feature = "simulated_output")
+))]
 use std::sync::mpsc::Sender as ASender;
 
 use kanata_keyberon::action::ReleasableState;
@@ -43,6 +94,9 @@ mod key_repeat;
 mod millisecond_counting;
 pub use millisecond_counting::*;
 
+mod scroll;
+use scroll::*;
+
 mod sequences;
 use sequences::*;
 
@@ -59,7 +113,7 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 
 #[cfg(target_os = "macos")]
@@ -80,8 +134,16 @@ type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 /// State of pressed keys on the physical keyboard.
 ///
 /// Notably this is not what keys kanata is outputting as pressed.
+#[cfg(not(all(target_os = "windows", not(feature = "interception_driver"))))]
 pub(crate) static PRESSED_KEYS: Lazy<Mutex<HashSet<OsCode>>> =
     Lazy::new(|| Mutex::new(HashSet::default()));
+#[cfg(all(target_os = "windows", not(feature = "interception_driver")))]
+pub(crate) static PRESSED_KEYS: Lazy<Mutex<HashMap<OsCode, web_time::Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::default()));
+
+/// Exit code to use when emergency exit (LCtrl+Space+Escape) is triggered.
+/// Configurable via --emergency-exit-code CLI argument. Default is 0.
+pub static EMERGENCY_EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 pub struct Kanata {
     /// Handle to some OS keyboard output mechanism.
@@ -121,6 +183,29 @@ pub struct Kanata {
     pub move_mouse_state_horizontal: Option<MoveMouseState>,
     /// A list of mouse speed modifiers in percentages by which mouse travel distance is scaled.
     pub move_mouse_speed_modifiers: Vec<u16>,
+    /// A list of mouse wheel speed modifiers in percentages by which scroll distance is scaled.
+    pub mousewheel_speed_modifiers: Vec<u16>,
+    /// Gamepad config declared by `defgamepad`, kept for live reload. `None`
+    /// without one: mapped `pad-*` input requires a declaration, even an
+    /// empty one.
+    pub gamepad_config: Option<kanata_parser::gamepad::GamepadConfig>,
+    /// Handle on the controller backend. `None` until
+    /// `start_gamepad_handling_if_configured` runs, and permanently `None` for
+    /// configurations that never mention a controller, which is what keeps
+    /// kanata from opening controller devices it was not asked to touch.
+    pub gamepad: Option<crate::gamepad::GamepadHandle>,
+    /// Carries fractional pointer and scroll movement between ticks.
+    gamepad_accumulator: crate::gamepad::Accumulator,
+    /// Whether the last sample found a stick asking for continuous movement.
+    ///
+    /// Read by `is_idle`. A stick held at a deflection reports *nothing* — it
+    /// is already where the user put it — so without this the processing loop
+    /// would conclude it had nothing to do and block, and the pointer would
+    /// freeze mid-push until the controller happened to send another event.
+    /// The keyboard-driven mouse states are in `is_idle` for the same reason.
+    gamepad_moving: bool,
+    /// Whether a debounced controller threshold crossing is waiting to settle.
+    gamepad_debounce_pending: bool,
     /// The user configuration for backtracking to find valid sequences. See
     /// <../../docs/sequence-adding-chords-ideas.md> for more info.
     pub sequence_backtrack_modcancel: bool,
@@ -155,25 +240,27 @@ pub struct Kanata {
     time_remainder: u128,
     /// Is true if a live reload was requested by the user and false otherwise.
     live_reload_requested: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     /// Linux input paths in the user configuration.
     pub kbd_in_paths: Vec<String>,
-    #[cfg(target_os = "linux")]
-    /// Tracks the Linux user configuration to continue or abort if no devices are found.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    /// Tracks the user configuration to continue or abort if no devices are found.
     continue_if_no_devices: bool,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     /// Tracks the Linux/Macos user configuration for device names (instead of paths) that should be
     /// included for interception and processing by kanata.
     pub include_names: Option<Vec<String>>,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     /// Tracks the Linux/Macos user configuration for device names (instead of paths) that should be
     /// excluded for interception and processing by kanata.
     pub exclude_names: Option<Vec<String>>,
+    /// Device ID mappings from `definputdevices` configuration block.
+    pub input_devices: Option<Vec<(std::num::NonZeroU8, kanata_parser::cfg::InputDeviceMatcher)>>,
     #[cfg(target_os = "windows")]
     /// Tracks whether Kanata should try to synchronize keystates with the Windows OS.
     /// Has no effect on Interception. Fixes some use cases related to admin window permissions and
     /// potentially locking via Win+L.
-    pub windows_sync_keystates: bool,
+    pub windows_sync_keystates: WinSyncKeystateBehaviour,
     #[cfg(all(feature = "interception_driver", target_os = "windows"))]
     /// Used to know which input device to treat as a mouse for intercepting and processing inputs
     /// by kanata.
@@ -192,13 +279,15 @@ pub struct Kanata {
     intercept_kb_hwids_exclude: Option<Vec<[u8; HWID_ARR_SZ]>>,
     /// User configuration to do logging of layer changes or not.
     log_layer_changes: bool,
+    /// When `true`, `log_layer_changes` prints only the *name* of the layer to the log. When `false`, the entire layer definition is printed.
+    log_layer_changes_name_only: bool,
     /// Tracks the caps-word state. Is Some(...) if caps-word is active and None otherwise.
     pub caps_word: Option<CapsWordState>,
     /// Config items from `defcfg`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub x11_repeat_rate: Option<KeyRepeatSettings>,
     /// Determines what types of devices to grab based on autodetection mode.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub device_detect_mode: DeviceDetectMode,
     /// Fake key actions that are waiting for a certain duration of kanata idling.
     pub waiting_for_idle: HashSet<FakeKeyOnIdle>,
@@ -236,13 +325,14 @@ pub struct Kanata {
     unmodded_mods: UnmodMods,
     /// Keys that should be unshifted. If non-empty, left+right shift keys should be cleared.
     unshifted_keys: Vec<KeyCode>,
+    /// Keys that are suppressed.
+    suppressed_keys: Vec<KeyCode>,
     /// Keep track of last pressed key for [`CustomAction::Repeat`].
     last_pressed_key: KeyCode,
-    #[cfg(feature = "tcp_server")]
     /// Names of fake keys mapped to their index in the fake keys row
     pub virtual_keys: HashMap<String, usize>,
-    /// The maximum value of switch's key-timing item in the configuration.
-    pub switch_max_key_timing: u16,
+    /// The maximum value of the any time-dependent check in the configuration.
+    pub max_key_timing_check: u16,
     #[cfg(feature = "tcp_server")]
     tcp_server_address: Option<SocketAddrWrapper>,
     #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -258,9 +348,23 @@ pub struct Kanata {
     #[cfg(any(
         all(target_os = "windows", feature = "interception_driver"),
         target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
         target_os = "unknown"
     ))]
-    mouse_movement_key: Arc<Mutex<Option<OsCode>>>,
+    pub(crate) mouse_movement_key: Arc<Mutex<Option<OsCode>>>,
+    /// Whether the loaded config outputs mouse buttons. Gates installing the
+    /// macOS mouse event tap (for drag-assist) so configs that never emit mouse
+    /// buttons do not request the extra Accessibility / Input Monitoring
+    /// permission. Shared with the tap's install gate and updated on reload.
+    #[cfg(target_os = "macos")]
+    pub(crate) emits_mouse_buttons: Arc<Mutex<bool>>,
+    /// Time when kanata started (for uptime tracking)
+    #[cfg(feature = "tcp_server")]
+    start_time: web_time::Instant,
+    /// Whether last reload was successful
+    #[cfg(feature = "tcp_server")]
+    last_reload_ok: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -287,16 +391,9 @@ enum ReloadAction {
     ReloadFile(String),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalculatedMouseMove {
     pub direction: MoveDirection,
-    pub distance: u16,
-}
-
-pub struct ScrollState {
-    pub direction: MWheelDirection,
-    pub interval: u16,
-    pub ticks_until_scroll: u16,
     pub distance: u16,
 }
 
@@ -319,8 +416,10 @@ pub struct MoveMouseAccelState {
 
 use once_cell::sync::Lazy;
 
-static MAPPED_KEYS: Lazy<Mutex<cfg::MappedKeys>> =
+pub(crate) static MAPPED_KEYS: Lazy<Mutex<cfg::MappedKeys>> =
     Lazy::new(|| Mutex::new(cfg::MappedKeys::default()));
+
+const LINUX_PERMISSIONS_ERROR: &str = "Failed to open the output uinput device. Make sure you added the user executing kanata to the 'uinput' group and that the 'uinput' group is configured correctly.\nSee for more detail: https://github.com/jtroo/kanata/blob/main/docs/setup-linux.md";
 
 impl Kanata {
     pub fn new(args: &ValidatedArgs) -> Result<Self> {
@@ -333,23 +432,22 @@ impl Kanata {
         };
 
         let kbd_out = match KbdOut::new(
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             &args.symlink_path,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             cfg.options.linux_opts.linux_use_trackpoint_property,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             &cfg.options.linux_opts.linux_output_name,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             match cfg.options.linux_opts.linux_output_bus_type {
                 LinuxCfgOutputBusType::BusUsb => evdev::BusType::BUS_USB,
                 LinuxCfgOutputBusType::BusI8042 => evdev::BusType::BUS_I8042,
+                LinuxCfgOutputBusType::BusVirtual => evdev::BusType::BUS_VIRTUAL,
             },
         ) {
             Ok(kbd_out) => kbd_out,
             Err(err) => {
-                error!(
-                    "Failed to open the output uinput device. Make sure you've added the user executing kanata to the `uinput` group"
-                );
+                error!("{LINUX_PERMISSIONS_ERROR}");
                 bail!(err)
             }
         };
@@ -397,6 +495,12 @@ impl Kanata {
             move_mouse_state_vertical: None,
             move_mouse_state_horizontal: None,
             move_mouse_speed_modifiers: Vec::new(),
+            mousewheel_speed_modifiers: Vec::new(),
+            gamepad_config: cfg.gamepad,
+            gamepad: None,
+            gamepad_accumulator: Default::default(),
+            gamepad_moving: false,
+            gamepad_debounce_pending: false,
             sequence_backtrack_modcancel: cfg.options.sequence_backtrack_modcancel,
             sequence_always_on: cfg.options.sequence_always_on,
             sequence_input_mode: cfg.options.sequence_input_mode,
@@ -412,16 +516,18 @@ impl Kanata {
             include_names: cfg.options.macos_opts.macos_dev_names_include,
             #[cfg(target_os = "macos")]
             exclude_names: cfg.options.macos_opts.macos_dev_names_exclude,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             kbd_in_paths: cfg.options.linux_opts.linux_dev,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             continue_if_no_devices: cfg.options.linux_opts.linux_continue_if_no_devs_found,
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "macos")]
+            continue_if_no_devices: cfg.options.macos_opts.macos_continue_if_no_devs_found,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             include_names: cfg.options.linux_opts.linux_dev_names_include,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             exclude_names: cfg.options.linux_opts.linux_dev_names_exclude,
             #[cfg(target_os = "windows")]
-            windows_sync_keystates: cfg.options.windows_opts.sync_keystates,
+            windows_sync_keystates: cfg.options.windows_opts.windows_sync_keystates,
             #[cfg(all(feature = "interception_driver", target_os = "windows"))]
             intercept_mouse_hwids: cfg.options.wintercept_opts.windows_interception_mouse_hwids,
             #[cfg(all(feature = "interception_driver", target_os = "windows"))]
@@ -444,6 +550,7 @@ impl Kanata {
             dynamic_macros: Default::default(),
             log_layer_changes: get_forced_log_layer_changes()
                 .unwrap_or(cfg.options.log_layer_changes),
+            log_layer_changes_name_only: cfg.options.log_layer_changes_name_only,
             caps_word: None,
             movemouse_smooth_diagonals: cfg.options.movemouse_smooth_diagonals,
             override_release_on_activation: cfg.options.override_release_on_activation,
@@ -452,9 +559,9 @@ impl Kanata {
             dynamic_macro_replay_behaviour: ReplayBehaviour {
                 delay: cfg.options.dynamic_macro_replay_delay_behaviour,
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             x11_repeat_rate: cfg.options.linux_opts.linux_x11_repeat_delay_rate,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             device_detect_mode: cfg
                 .options
                 .linux_opts
@@ -469,10 +576,11 @@ impl Kanata {
             unmodded_keys: vec![],
             unmodded_mods: UnmodMods::empty(),
             unshifted_keys: vec![],
+            suppressed_keys: vec![],
             last_pressed_key: KeyCode::No,
-            #[cfg(feature = "tcp_server")]
             virtual_keys: cfg.fake_keys,
-            switch_max_key_timing: cfg.switch_max_key_timing,
+            max_key_timing_check: cfg.max_key_timing_check,
+            input_devices: cfg.input_devices,
             #[cfg(feature = "tcp_server")]
             tcp_server_address: args.tcp_server_address.clone(),
             #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -482,10 +590,17 @@ impl Kanata {
             saved_clipboard_content: Default::default(),
             #[cfg(any(
                 all(target_os = "windows", feature = "interception_driver"),
-                target_os = "linux",
+                any(target_os = "linux", target_os = "android"),
+                target_os = "macos",
                 target_os = "unknown"
             ))]
             mouse_movement_key: Arc::new(Mutex::new(cfg.options.mouse_movement_key)),
+            #[cfg(target_os = "macos")]
+            emits_mouse_buttons: Arc::new(Mutex::new(cfg.emits_mouse_buttons)),
+            #[cfg(feature = "tcp_server")]
+            start_time: web_time::Instant::now(),
+            #[cfg(feature = "tcp_server")]
+            last_reload_ok: true,
         })
     }
 
@@ -503,23 +618,22 @@ impl Kanata {
         };
 
         let kbd_out = match KbdOut::new(
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             &None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             cfg.options.linux_opts.linux_use_trackpoint_property,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             &cfg.options.linux_opts.linux_output_name,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             match cfg.options.linux_opts.linux_output_bus_type {
                 LinuxCfgOutputBusType::BusUsb => evdev::BusType::BUS_USB,
                 LinuxCfgOutputBusType::BusI8042 => evdev::BusType::BUS_I8042,
+                LinuxCfgOutputBusType::BusVirtual => evdev::BusType::BUS_VIRTUAL,
             },
         ) {
             Ok(kbd_out) => kbd_out,
             Err(err) => {
-                error!(
-                    "Failed to open the output uinput device. Make sure you've added the user executing kanata to the `uinput` group"
-                );
+                error!("{LINUX_PERMISSIONS_ERROR}");
                 bail!(err)
             }
         };
@@ -545,6 +659,12 @@ impl Kanata {
             move_mouse_state_vertical: None,
             move_mouse_state_horizontal: None,
             move_mouse_speed_modifiers: Vec::new(),
+            mousewheel_speed_modifiers: Vec::new(),
+            gamepad_config: cfg.gamepad,
+            gamepad: None,
+            gamepad_accumulator: Default::default(),
+            gamepad_moving: false,
+            gamepad_debounce_pending: false,
             sequence_backtrack_modcancel: cfg.options.sequence_backtrack_modcancel,
             sequence_always_on: cfg.options.sequence_always_on,
             sequence_input_mode: cfg.options.sequence_input_mode,
@@ -560,16 +680,18 @@ impl Kanata {
             include_names: cfg.options.macos_opts.macos_dev_names_include,
             #[cfg(target_os = "macos")]
             exclude_names: cfg.options.macos_opts.macos_dev_names_exclude,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             kbd_in_paths: cfg.options.linux_opts.linux_dev,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             continue_if_no_devices: cfg.options.linux_opts.linux_continue_if_no_devs_found,
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "macos")]
+            continue_if_no_devices: cfg.options.macos_opts.macos_continue_if_no_devs_found,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             include_names: cfg.options.linux_opts.linux_dev_names_include,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             exclude_names: cfg.options.linux_opts.linux_dev_names_exclude,
             #[cfg(target_os = "windows")]
-            windows_sync_keystates: cfg.options.windows_opts.sync_keystates,
+            windows_sync_keystates: cfg.options.windows_opts.windows_sync_keystates,
             #[cfg(all(feature = "interception_driver", target_os = "windows"))]
             intercept_mouse_hwids: cfg.options.wintercept_opts.windows_interception_mouse_hwids,
             #[cfg(all(feature = "interception_driver", target_os = "windows"))]
@@ -592,6 +714,7 @@ impl Kanata {
             dynamic_macros: Default::default(),
             log_layer_changes: get_forced_log_layer_changes()
                 .unwrap_or(cfg.options.log_layer_changes),
+            log_layer_changes_name_only: cfg.options.log_layer_changes_name_only,
             caps_word: None,
             movemouse_smooth_diagonals: cfg.options.movemouse_smooth_diagonals,
             override_release_on_activation: cfg.options.override_release_on_activation,
@@ -600,9 +723,9 @@ impl Kanata {
             dynamic_macro_replay_behaviour: ReplayBehaviour {
                 delay: cfg.options.dynamic_macro_replay_delay_behaviour,
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             x11_repeat_rate: cfg.options.linux_opts.linux_x11_repeat_delay_rate,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             device_detect_mode: cfg
                 .options
                 .linux_opts
@@ -617,10 +740,11 @@ impl Kanata {
             unmodded_keys: vec![],
             unmodded_mods: UnmodMods::empty(),
             unshifted_keys: vec![],
+            suppressed_keys: vec![],
             last_pressed_key: KeyCode::No,
-            #[cfg(feature = "tcp_server")]
             virtual_keys: cfg.fake_keys,
-            switch_max_key_timing: cfg.switch_max_key_timing,
+            max_key_timing_check: cfg.max_key_timing_check,
+            input_devices: cfg.input_devices,
             #[cfg(feature = "tcp_server")]
             tcp_server_address: None,
             #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -631,13 +755,24 @@ impl Kanata {
             #[cfg(any(
                 all(target_os = "windows", feature = "interception_driver"),
                 target_os = "linux",
+                target_os = "android",
+                target_os = "macos",
                 target_os = "unknown"
             ))]
             mouse_movement_key: Arc::new(Mutex::new(cfg.options.mouse_movement_key)),
+            #[cfg(target_os = "macos")]
+            emits_mouse_buttons: Arc::new(Mutex::new(cfg.emits_mouse_buttons)),
+            #[cfg(feature = "tcp_server")]
+            start_time: web_time::Instant::now(),
+            #[cfg(feature = "tcp_server")]
+            last_reload_ok: true,
         })
     }
 
-    #[cfg(feature = "passthru_ahk")]
+    #[cfg(any(
+        feature = "passthru_ahk",
+        all(feature = "simulated_input", feature = "simulated_output")
+    ))]
     pub fn new_with_output_channel(
         args: &ValidatedArgs,
         tx: Option<ASender<InputEvent>>,
@@ -647,11 +782,15 @@ impl Kanata {
         Ok(Arc::new(Mutex::new(k)))
     }
 
-    fn do_live_reload(&mut self, _tx: &Option<Sender<ServerMessage>>) -> Result<()> {
+    pub(crate) fn do_live_reload(&mut self, _tx: &Option<Sender<ServerMessage>>) -> Result<()> {
         let cfg = match cfg::new_from_file(&self.cfg_paths[self.cur_cfg_idx]) {
             Ok(c) => c,
             Err(e) => {
                 log::error!("{e:?}");
+                #[cfg(feature = "tcp_server")]
+                {
+                    self.last_reload_ok = false;
+                }
                 bail!("failed to parse config file");
             }
         };
@@ -676,14 +815,15 @@ impl Kanata {
         self.dynamic_macro_replay_behaviour = ReplayBehaviour {
             delay: cfg.options.dynamic_macro_replay_delay_behaviour,
         };
-        self.switch_max_key_timing = cfg.switch_max_key_timing;
-        #[cfg(feature = "tcp_server")]
-        {
-            self.virtual_keys = cfg.fake_keys;
-        }
+        self.max_key_timing_check = cfg.max_key_timing_check;
+        // Note: input_devices is intentionally not updated on live reload.
+        // The KbdIn device_hash_to_id map is built at startup and not rebuilt.
+        // This matches behavior of other device configs (macos-dev-names-include, etc.).
+        // See: https://github.com/malpern/kanata/issues/13
+        self.virtual_keys = cfg.fake_keys;
         #[cfg(target_os = "windows")]
         {
-            self.windows_sync_keystates = cfg.options.windows_opts.sync_keystates;
+            self.windows_sync_keystates = cfg.options.windows_opts.windows_sync_keystates;
         }
         #[cfg(all(target_os = "windows", feature = "gui"))]
         {
@@ -704,8 +844,37 @@ impl Kanata {
         }
 
         *MAPPED_KEYS.lock() = cfg.mapped_keys;
-        #[cfg(target_os = "linux")]
+        // Hand the new projections over *after* MAPPED_KEYS is current, so the
+        // releases this produces are gated against the new mapping rather than
+        // the old one.
+        self.gamepad_config = cfg.gamepad;
+        {
+            // Whatever the new declaration is, the pointer starts from rest:
+            // a fraction of a pixel left over from the old projection has no
+            // meaning under the new one.
+            self.gamepad_accumulator.reset();
+            self.gamepad_moving = false;
+            self.gamepad_debounce_pending = false;
+            let mut edges = Vec::new();
+            match (&mut self.gamepad, self.gamepad_config) {
+                (Some(gamepad), config) => {
+                    gamepad.reconfigure(config.unwrap_or_default(), &mut edges)
+                }
+                // Adding controller input to a running instance needs the
+                // channel that only startup has, so it takes a restart.
+                (None, Some(_)) => log::warn!(
+                    "controller input was added by this reload, but its backend starts \
+                     at launch. Restart kanata to pick up the controller."
+                ),
+                (None, None) => {}
+            }
+            self.apply_gamepad_edges(&edges)?;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         Kanata::set_repeat_rate(cfg.options.linux_opts.linux_x11_repeat_delay_rate)?;
+        // The macOS mouse-tap reload hook is invoked further down, *after* the
+        // `mouse_movement_key` mutate, so its install gate sees fresh state
+        // for both `MAPPED_KEYS` and `mouse_movement_key`.
         log::info!("Live reload successful");
         #[cfg(feature = "tcp_server")]
         if let Some(tx) = _tx {
@@ -733,6 +902,8 @@ impl Kanata {
         #[cfg(any(
             all(target_os = "windows", feature = "interception_driver"),
             target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
             target_os = "unknown"
         ))]
         {
@@ -748,6 +919,19 @@ impl Kanata {
             }
 
             *self.mouse_movement_key.lock() = cfg.options.mouse_movement_key;
+
+            // Refresh the mouse-button-output flag so the reload install gate
+            // (below) sees whether the new config emits mouse buttons. The tap
+            // reads this Arc live, so a reload that starts emitting mouse
+            // buttons installs the tap; the tap is process-lifetime and is not
+            // uninstalled if a later reload stops emitting them.
+            #[cfg(target_os = "macos")]
+            {
+                *self.emits_mouse_buttons.lock() = cfg.emits_mouse_buttons;
+            }
+
+            #[cfg(target_os = "macos")]
+            crate::oskbd::ensure_mouse_listener_installed_after_reload();
         }
 
         PRESSED_KEYS.lock().clear();
@@ -765,12 +949,23 @@ impl Kanata {
         #[cfg(all(target_os = "windows", feature = "gui"))]
         send_gui_cfg_notice();
 
+        #[cfg(feature = "tcp_server")]
+        {
+            self.last_reload_ok = true;
+        }
+
         Ok(())
     }
 
     /// Update keyberon layout state for press/release, handle repeat separately
     pub fn handle_input_event(&mut self, event: &KeyEvent) -> Result<()> {
         log::debug!("process recv ev {event:?}");
+        if event.value == KeyValue::Press {
+            self.layout
+                .bm()
+                .device_history
+                .push_front(event.device_id());
+        }
         let evc: u16 = event.code.into();
         self.ticks_since_idle = 0;
         let kbrn_ev = match event.value {
@@ -841,8 +1036,6 @@ impl Kanata {
     fn handle_time_ticks(&mut self, tx: &Option<Sender<ServerMessage>>) -> Result<u16> {
         let ms_elapsed = self.get_ms_elapsed();
         self.tick_ms(ms_elapsed, tx)?;
-
-        self.check_handle_layer_change(tx);
 
         if self.live_reload_requested
             && ((self.prev_keys.is_empty() && self.cur_keys.is_empty())
@@ -920,6 +1113,8 @@ impl Kanata {
         self.live_reload_requested |= self.handle_keystate_changes(_tx)?;
         self.handle_scrolling()?;
         self.handle_move_mouse()?;
+        self.handle_gamepad_edges()?;
+        self.handle_gamepad_motion()?;
         self.tick_sequence_state()?;
         self.tick_idle_timeout();
         self.tick_physical_idle_timeout();
@@ -936,23 +1131,127 @@ impl Kanata {
         Ok(())
     }
 
+    /// Drive the pointer and wheel from any control with a motion projection.
+    ///
+    /// Sampled here rather than pushed from the controller thread because a
+    /// deflection is a rate: how fast the pointer moves should depend on the
+    /// clock, not on how often a particular controller reports.
+    fn handle_gamepad_motion(&mut self) -> Result<()> {
+        let Some(gamepad) = self.gamepad.as_ref().filter(|g| g.drives_motion()) else {
+            return Ok(());
+        };
+        let demand = gamepad.demand();
+        // Recorded before the early return so `is_idle` sees both edges of it.
+        self.gamepad_moving = !demand.is_idle();
+        if demand.is_idle() {
+            // Drop any partial movement so a leftover fraction cannot surface
+            // as a stray pixel the next time a stick is pushed.
+            self.gamepad_accumulator.reset();
+            return Ok(());
+        }
+        let accrued = self.gamepad_accumulator.accrue(demand);
+        if accrued.is_empty() {
+            return Ok(());
+        }
+        // A controller pointer is still kanata's pointer, so `movemouse-speed`
+        // scales it exactly as it scales the mousemove actions.
+        let moves = accrued.mouse_moves(|distance| {
+            apply_mouse_distance_modifiers(distance, &self.move_mouse_speed_modifiers)
+        });
+        match moves {
+            // Both axes in one call, which is what keeps a diagonal from being
+            // delivered as two perpendicular steps.
+            [Some(x), Some(y)] => self.kbd_out.move_mouse_many(&[x, y])?,
+            [Some(mv), None] | [None, Some(mv)] => self.kbd_out.move_mouse(mv)?,
+            [None, None] => {}
+        }
+        for (direction, distance) in accrued.scrolls().into_iter().flatten() {
+            let distance =
+                apply_mouse_distance_modifiers(distance, &self.mousewheel_speed_modifiers);
+            self.kbd_out.scroll(direction, distance)?;
+        }
+        Ok(())
+    }
+
+    /// Advance controller thresholds that are waiting to settle.
+    ///
+    /// This follows Kanata's other millisecond waiting states: the backend
+    /// records a pending crossing, and the processing loop owns the clock and
+    /// applies the eventual edges through the normal layout path.
+    fn handle_gamepad_edges(&mut self) -> Result<()> {
+        let Some(gamepad) = self.gamepad.as_ref() else {
+            self.gamepad_debounce_pending = false;
+            return Ok(());
+        };
+        let mut edges = Vec::new();
+        gamepad.tick(1, &mut edges);
+        self.gamepad_debounce_pending = gamepad.has_pending();
+        self.apply_gamepad_edges(&edges)
+    }
+
+    /// Feed edges a controller produced into the processing loop.
+    ///
+    /// For the callers that already run *on* the processing thread: a live
+    /// reload and a state clean. They hand the events straight to
+    /// `handle_input_event` rather than down the input channel, because the
+    /// channel's only reader is this very thread and a self-send has to be a
+    /// `try_send` that drops a release when the queue is full.
+    ///
+    /// The controller thread cannot use this — it is a different thread — and
+    /// sends `KeyEvent`s down the channel instead. Both paths pass through the
+    /// same `defsrc` gate, and neither holds a lock across the delivery.
+    pub(crate) fn apply_gamepad_edges(
+        &mut self,
+        edges: &[kanata_parser::gamepad::PadEdge],
+    ) -> Result<()> {
+        let mut events = Vec::new();
+        crate::gamepad::gate_on_defsrc(edges, &mut events);
+        for event in events {
+            self.handle_input_event(&event)?;
+        }
+        Ok(())
+    }
+
+    /// Start controller input handling if the configuration maps a controller
+    /// control or declares an analog projection. A no-op otherwise.
+    ///
+    /// Separate from `new` because the backend needs the channel into the
+    /// processing loop, which does not exist until the caller has built it.
+    pub fn start_gamepad_handling_if_configured(kanata: &Arc<Mutex<Self>>, tx: Sender<KeyEvent>) {
+        let mut k = kanata.lock();
+        let Some(config) = k.gamepad_config else {
+            return;
+        };
+        let devices = k.input_devices.clone();
+        let handle = crate::gamepad::GamepadHandle::new(config, devices.as_deref());
+        handle.spawn_backend(tx);
+        k.gamepad = Some(handle);
+    }
+
     fn handle_scrolling(&mut self) -> Result<()> {
-        if let Some(scroll_state) = &mut self.scroll_state {
-            if scroll_state.ticks_until_scroll == 0 {
-                scroll_state.ticks_until_scroll = scroll_state.interval - 1;
-                self.kbd_out
-                    .scroll(scroll_state.direction, scroll_state.distance)?;
-            } else {
-                scroll_state.ticks_until_scroll -= 1;
+        if let Some((direction, distance)) = update_scrollstate_get_result(&mut self.scroll_state) {
+            match distance {
+                0 => {
+                    self.scroll_state = None;
+                }
+                _ => {
+                    let distance =
+                        apply_mouse_distance_modifiers(distance, &self.mousewheel_speed_modifiers);
+                    self.kbd_out.scroll(direction, distance)?;
+                }
             }
         }
-        if let Some(hscroll_state) = &mut self.hscroll_state {
-            if hscroll_state.ticks_until_scroll == 0 {
-                hscroll_state.ticks_until_scroll = hscroll_state.interval - 1;
-                self.kbd_out
-                    .scroll(hscroll_state.direction, hscroll_state.distance)?;
-            } else {
-                hscroll_state.ticks_until_scroll -= 1;
+        if let Some((direction, distance)) = update_scrollstate_get_result(&mut self.hscroll_state)
+        {
+            match distance {
+                0 => {
+                    self.hscroll_state = None;
+                }
+                _ => {
+                    let distance =
+                        apply_mouse_distance_modifiers(distance, &self.mousewheel_speed_modifiers);
+                    self.kbd_out.scroll(direction, distance)?;
+                }
             }
         }
         Ok(())
@@ -1114,46 +1413,96 @@ impl Kanata {
     fn handle_keystate_changes(&mut self, _tx: &Option<Sender<ServerMessage>>) -> Result<bool> {
         let layout = self.layout.bm();
         let custom_event = layout.tick();
+
+        #[cfg(feature = "tcp_server")]
+        {
+            let key_name = |key_pos| {
+                if key_pos < KEY_MAX {
+                    let osc = OsCode::from(key_pos);
+                    osc.to_string().to_lowercase()
+                } else {
+                    // The chordsv2 internals uses unnameable faked higher key positions for the
+                    // coordinates of activated actions within keyberon states.
+                    // Give them a custom name.
+                    format!("chordsv2:{}", key_pos - KEY_MAX)
+                }
+            };
+            if let Some(hold_info) = layout.tap_hold_tracker.take_hold_activated()
+                && hold_info.coord.0 == NORMAL_KEY_ROW
+                && let Some(tx) = _tx
+            {
+                let key = key_name(hold_info.coord.1);
+                log::warn!("HoldActivated: key={key} coord={:?}", hold_info.coord);
+                match tx.try_send(ServerMessage::HoldActivated { key }) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::error!("could not send HoldActivated event: {}", error);
+                    }
+                }
+            }
+            if let Some(tap_info) = layout.tap_hold_tracker.take_tap_activated()
+                && tap_info.coord.0 == NORMAL_KEY_ROW
+                && let Some(tx) = _tx
+            {
+                let key = key_name(tap_info.coord.1);
+                log::warn!("TapActivated: key={key} coord={:?}", tap_info.coord);
+                match tx.try_send(ServerMessage::TapActivated { key }) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::error!("could not send TapActivated event: {}", error);
+                    }
+                }
+            }
+        }
+
         let mut live_reload_requested = false;
         let cur_keys = &mut self.cur_keys;
         cur_keys.extend(layout.keycodes());
         let mut reverse_release_order = false;
 
-        // Deal with unmodded. Unlike other custom actions, this should come before key presses and
-        // releases. I don't quite remember why custom actions come after the key processing, but I
-        // remember that it is intentional. However, since unmodded needs to modify the key lists,
-        // it should come before.
+        // Deal with unmodded and other early custom actions.
+        // Unlike other custom actions, these should come before key presses and releases.
+        // I don't quite remember why custom actions come after the key processing,
+        // but I remember that it is intentional.
+        // However, since unmodded needs to modify the key lists,
+        // and SequenceNoerase may need to be evaluated within multi before a key
+        // that completes the sequence, it should come before.
         match custom_event {
-            CustomEvent::Press(custacts) => {
-                for custact in custacts.iter() {
-                    match custact {
-                        CustomAction::Unmodded { keys, mods } => {
-                            self.unmodded_keys.extend(keys.iter());
-                            self.unmodded_mods = *mods;
-                        }
-                        CustomAction::Unshifted { keys } => {
-                            self.unshifted_keys.extend(keys.iter());
-                        }
-                        _ => {}
+            CustomEvent::Press(custact) => match custact {
+                CustomAction::Unmodded { keys, mods } => {
+                    self.unmodded_keys.extend(keys.iter());
+                    self.unmodded_mods = *mods;
+                }
+                CustomAction::Unshifted { keys } => {
+                    self.unshifted_keys.extend(keys.iter());
+                }
+                CustomAction::Suppressed { suppressed_keys } => {
+                    self.suppressed_keys.extend(suppressed_keys.iter());
+                }
+                CustomAction::SequenceNoerase(noerase_count) => {
+                    if let Some(state) = self.sequence_state.get_active() {
+                        log::debug!("adding noerase: {noerase_count}");
+                        add_noerase(state, *noerase_count);
                     }
                 }
-            }
-            CustomEvent::Release(custacts) => {
-                for custact in custacts.iter() {
-                    match custact {
-                        CustomAction::Unmodded { keys, mods: _ } => {
-                            self.unmodded_keys.retain(|k| !keys.contains(k));
-                        }
-                        CustomAction::Unshifted { keys } => {
-                            self.unshifted_keys.retain(|k| !keys.contains(k));
-                        }
-                        CustomAction::ReverseReleaseOrder => {
-                            reverse_release_order = true;
-                        }
-                        _ => {}
-                    }
+                _ => {}
+            },
+            CustomEvent::Release(custact) => match custact {
+                CustomAction::Unmodded { keys, mods: _ } => {
+                    self.unmodded_keys.retain(|k| !keys.contains(k));
                 }
-            }
+                CustomAction::Unshifted { keys } => {
+                    self.unshifted_keys.retain(|k| !keys.contains(k));
+                }
+                CustomAction::Suppressed { suppressed_keys } => {
+                    self.suppressed_keys
+                        .retain(|k| !suppressed_keys.contains(k));
+                }
+                CustomAction::ReverseReleaseOrder => {
+                    reverse_release_order = true;
+                }
+                _ => {}
+            },
             _ => {}
         }
         if !self.unmodded_keys.is_empty() {
@@ -1177,9 +1526,15 @@ impl Kanata {
             cur_keys.retain(|k| !matches!(k, KeyCode::LShift | KeyCode::RShift));
             cur_keys.extend(self.unshifted_keys.iter());
         }
+        if !self.suppressed_keys.is_empty() {
+            cur_keys.retain(|k| !self.suppressed_keys.contains(k))
+        }
 
-        self.overrides
-            .override_keys(cur_keys, &mut self.override_states);
+        self.overrides.override_keys(
+            cur_keys,
+            &mut self.override_states,
+            layout.current_layer() as u16,
+        );
         mark_overridden_nonmodkeys_for_eager_erasure(&self.override_states, &mut layout.states);
         if self.override_release_on_activation {
             for removed in self.override_states.removed_oscs() {
@@ -1316,6 +1671,35 @@ impl Kanata {
                 )?;
             } else {
                 log::debug!("key press     {:?}", k);
+
+                // BUG(#2157): Halt wheel in decelerating state on new mod press.
+                // It is undesirable to have a lingering mwheel deceleration
+                // when pressing a new modifier key like control or alt,
+                // because these mod keys often interact with the ongoing mwheel activity
+                // in non-independent ways, e.g. zooming in/out.
+                if k.is_mod() {
+                    let v_is_decelerating =
+                        self.scroll_state.as_ref().is_some_and(|vscroll_state| {
+                            vscroll_state
+                                .scroll_accel_state
+                                .as_ref()
+                                .is_some_and(|vscroll_acc_state| vscroll_acc_state.scroll_released)
+                        });
+                    if v_is_decelerating {
+                        self.scroll_state = None;
+                    }
+                    let h_is_decelerating =
+                        self.hscroll_state.as_ref().is_some_and(|hscroll_state| {
+                            hscroll_state
+                                .scroll_accel_state
+                                .as_ref()
+                                .is_some_and(|hscroll_acc_state| hscroll_acc_state.scroll_released)
+                        });
+                    if h_is_decelerating {
+                        self.hscroll_state = None;
+                    }
+                }
+
                 if let Err(e) = press_key(&mut self.kbd_out, k.into()) {
                     bail!("failed to press key: {:?}", e);
                 }
@@ -1325,110 +1709,127 @@ impl Kanata {
         // Handle custom events. This used to be in a separate function but lifetime issues cause
         // it to now be here.
         match custom_event {
-            CustomEvent::Press(custacts) => {
+            CustomEvent::Press(custact) => {
                 #[cfg(feature = "cmd")]
                 let mut cmds = vec![];
-                let mut prev_mouse_btn = None;
+
                 let mut reload_action: Option<ReloadAction> = None;
-                for custact in custacts.iter() {
-                    match custact {
-                        // For unicode, only send on the press. No repeat action is supported for this for
-                        // now.
-                        CustomAction::Unicode(c) => self.kbd_out.send_unicode(*c)?,
-                        CustomAction::LiveReload => {
-                            reload_action = Some(ReloadAction::Reload);
+                match custact {
+                    // For unicode, only send on the press. No repeat action is supported for this for
+                    // now.
+                    CustomAction::Unicode(c) => self.kbd_out.send_unicode(*c)?,
+                    CustomAction::LiveReload => {
+                        reload_action = Some(ReloadAction::Reload);
+                    }
+                    CustomAction::LiveReloadNext => {
+                        reload_action = Some(ReloadAction::ReloadNext);
+                    }
+                    CustomAction::LiveReloadPrev => {
+                        reload_action = Some(ReloadAction::ReloadPrev);
+                    }
+                    CustomAction::LiveReloadNum(n) => {
+                        reload_action = Some(ReloadAction::ReloadNum(usize::from(*n)));
+                    }
+                    CustomAction::LiveReloadFile(path) => {
+                        reload_action = Some(ReloadAction::ReloadFile(path.to_string()));
+                    }
+                    CustomAction::Mouse(btn) => {
+                        self.kbd_out.click_btn(*btn)?;
+                    }
+                    CustomAction::MouseTap(btn) => {
+                        log::debug!("click     {:?}", btn);
+                        self.kbd_out.click_btn(*btn)?;
+                        log::debug!("unclick   {:?}", btn);
+                        self.kbd_out.release_btn(*btn)?;
+                    }
+                    CustomAction::MWheel {
+                        direction,
+                        interval,
+                        distance,
+                        inertial_scroll_params,
+                    } => {
+                        let state = new_scroll_state(
+                            *direction,
+                            *interval,
+                            *distance,
+                            *inertial_scroll_params,
+                        );
+                        if is_vertical_scroll_direction(*direction) {
+                            self.scroll_state = Some(state);
+                        } else {
+                            self.hscroll_state = Some(state);
                         }
-                        CustomAction::LiveReloadNext => {
-                            reload_action = Some(ReloadAction::ReloadNext);
+                    }
+                    CustomAction::MWheelNotch { direction } => {
+                        self.kbd_out
+                            .scroll(*direction, HI_RES_SCROLL_UNITS_IN_LO_RES)?;
+                    }
+                    CustomAction::MoveMouse {
+                        direction,
+                        interval,
+                        distance,
+                    } => match direction {
+                        MoveDirection::Up | MoveDirection::Down => {
+                            self.move_mouse_state_vertical = Some(MoveMouseState {
+                                direction: *direction,
+                                distance: *distance,
+                                ticks_until_move: 0,
+                                interval: *interval,
+                                move_mouse_accel_state: None,
+                            })
                         }
-                        CustomAction::LiveReloadPrev => {
-                            reload_action = Some(ReloadAction::ReloadPrev);
+                        MoveDirection::Left | MoveDirection::Right => {
+                            self.move_mouse_state_horizontal = Some(MoveMouseState {
+                                direction: *direction,
+                                distance: *distance,
+                                ticks_until_move: 0,
+                                interval: *interval,
+                                move_mouse_accel_state: None,
+                            })
                         }
-                        CustomAction::LiveReloadNum(n) => {
-                            reload_action = Some(ReloadAction::ReloadNum(usize::from(*n)));
-                        }
-                        CustomAction::LiveReloadFile(path) => {
-                            reload_action = Some(ReloadAction::ReloadFile(path.clone()));
-                        }
-                        CustomAction::Mouse(btn) => {
-                            log::debug!("click     {:?}", btn);
-                            if let Some(pbtn) = prev_mouse_btn {
-                                log::debug!("unclick   {:?}", pbtn);
-                                self.kbd_out.release_btn(pbtn)?;
-                            }
-                            self.kbd_out.click_btn(*btn)?;
-                            prev_mouse_btn = Some(*btn);
-                        }
-                        CustomAction::MouseTap(btn) => {
-                            log::debug!("click     {:?}", btn);
-                            self.kbd_out.click_btn(*btn)?;
-                            log::debug!("unclick   {:?}", btn);
-                            self.kbd_out.release_btn(*btn)?;
-                        }
-                        CustomAction::MWheel {
+                    },
+                    CustomAction::MoveMouseAccel {
+                        direction,
+                        interval,
+                        accel_time,
+                        min_distance,
+                        max_distance,
+                    } => {
+                        // Inheriting acceleration is normally desired so that a new
+                        // axis starts at the same speed as one already in flight
+                        // (e.g. diagonal movement), matching QMK's behavior. But
+                        // reversing direction on the *same* axis (accel-left held,
+                        // then accel-right pressed) must reset instead of
+                        // inheriting: otherwise the maxed-out speed carries into
+                        // the reversed movement and causes a jarring turnaround
+                        // on overshoot. The other axis is unaffected by this axis
+                        // reversing, so it stays eligible to be inherited from.
+                        let is_horizontal = matches!(
                             direction,
-                            interval,
-                            distance,
-                        } => match direction {
-                            MWheelDirection::Up | MWheelDirection::Down => {
-                                self.scroll_state = Some(ScrollState {
-                                    direction: *direction,
-                                    distance: *distance,
-                                    ticks_until_scroll: 0,
-                                    interval: *interval,
-                                })
-                            }
-                            MWheelDirection::Left | MWheelDirection::Right => {
-                                self.hscroll_state = Some(ScrollState {
-                                    direction: *direction,
-                                    distance: *distance,
-                                    ticks_until_scroll: 0,
-                                    interval: *interval,
-                                })
-                            }
-                        },
-                        CustomAction::MWheelNotch { direction } => {
-                            self.kbd_out
-                                .scroll(*direction, HI_RES_SCROLL_UNITS_IN_LO_RES)?;
-                        }
-                        CustomAction::MoveMouse {
-                            direction,
-                            interval,
-                            distance,
-                        } => match direction {
-                            MoveDirection::Up | MoveDirection::Down => {
-                                self.move_mouse_state_vertical = Some(MoveMouseState {
-                                    direction: *direction,
-                                    distance: *distance,
-                                    ticks_until_move: 0,
-                                    interval: *interval,
-                                    move_mouse_accel_state: None,
-                                })
-                            }
-                            MoveDirection::Left | MoveDirection::Right => {
-                                self.move_mouse_state_horizontal = Some(MoveMouseState {
-                                    direction: *direction,
-                                    distance: *distance,
-                                    ticks_until_move: 0,
-                                    interval: *interval,
-                                    move_mouse_accel_state: None,
-                                })
-                            }
-                        },
-                        CustomAction::MoveMouseAccel {
-                            direction,
-                            interval,
-                            accel_time,
-                            min_distance,
-                            max_distance,
-                        } => {
-                            let move_mouse_accel_state = match (
-                                self.movemouse_inherit_accel_state,
-                                &self.move_mouse_state_horizontal,
-                                &self.move_mouse_state_vertical,
-                            ) {
+                            MoveDirection::Left | MoveDirection::Right
+                        );
+                        let same_axis_state = if is_horizontal {
+                            &self.move_mouse_state_horizontal
+                        } else {
+                            &self.move_mouse_state_vertical
+                        };
+                        let reversing_direction = matches!(
+                            same_axis_state,
+                            Some(MoveMouseState { direction: active, .. })
+                                if is_opposite_move_direction(*active, *direction)
+                        );
+                        let is_vertical = !is_horizontal;
+                        let horizontal_source = self
+                            .move_mouse_state_horizontal
+                            .as_ref()
+                            .filter(|_| is_vertical || !reversing_direction);
+                        let vertical_source = self
+                            .move_mouse_state_vertical
+                            .as_ref()
+                            .filter(|_| is_horizontal || !reversing_direction);
+                        let inherited_accel_state = if self.movemouse_inherit_accel_state {
+                            match (horizontal_source, vertical_source) {
                                 (
-                                    true,
                                     Some(MoveMouseState {
                                         move_mouse_accel_state: Some(s),
                                         ..
@@ -1436,279 +1837,282 @@ impl Kanata {
                                     _,
                                 )
                                 | (
-                                    true,
                                     _,
                                     Some(MoveMouseState {
                                         move_mouse_accel_state: Some(s),
                                         ..
                                     }),
-                                ) => *s,
-                                _ => {
-                                    let f_max_distance: f64 = *max_distance as f64;
-                                    let f_min_distance: f64 = *min_distance as f64;
-                                    let f_accel_time: f64 = *accel_time as f64;
-                                    let increment =
-                                        (f_max_distance - f_min_distance) / f_accel_time;
+                                ) => Some(*s),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let move_mouse_accel_state = inherited_accel_state.unwrap_or_else(|| {
+                            let f_max_distance: f64 = *max_distance as f64;
+                            let f_min_distance: f64 = *min_distance as f64;
+                            let f_accel_time: f64 = *accel_time as f64;
+                            let increment = (f_max_distance - f_min_distance) / f_accel_time;
 
-                                    MoveMouseAccelState {
-                                        accel_ticks_from_min: 0,
-                                        accel_ticks_until_max: *accel_time,
-                                        accel_increment: increment,
-                                        min_distance: *min_distance,
-                                        max_distance: *max_distance,
-                                    }
-                                }
-                            };
+                            MoveMouseAccelState {
+                                accel_ticks_from_min: 0,
+                                accel_ticks_until_max: *accel_time,
+                                accel_increment: increment,
+                                min_distance: *min_distance,
+                                max_distance: *max_distance,
+                            }
+                        });
 
-                            match direction {
-                                MoveDirection::Up | MoveDirection::Down => {
-                                    self.move_mouse_state_vertical = Some(MoveMouseState {
-                                        direction: *direction,
-                                        distance: *min_distance,
-                                        ticks_until_move: 0,
-                                        interval: *interval,
-                                        move_mouse_accel_state: Some(move_mouse_accel_state),
-                                    })
-                                }
-                                MoveDirection::Left | MoveDirection::Right => {
-                                    self.move_mouse_state_horizontal = Some(MoveMouseState {
-                                        direction: *direction,
-                                        distance: *min_distance,
-                                        ticks_until_move: 0,
-                                        interval: *interval,
-                                        move_mouse_accel_state: Some(move_mouse_accel_state),
-                                    })
-                                }
+                        match direction {
+                            MoveDirection::Up | MoveDirection::Down => {
+                                self.move_mouse_state_vertical = Some(MoveMouseState {
+                                    direction: *direction,
+                                    distance: *min_distance,
+                                    ticks_until_move: 0,
+                                    interval: *interval,
+                                    move_mouse_accel_state: Some(move_mouse_accel_state),
+                                })
+                            }
+                            MoveDirection::Left | MoveDirection::Right => {
+                                self.move_mouse_state_horizontal = Some(MoveMouseState {
+                                    direction: *direction,
+                                    distance: *min_distance,
+                                    ticks_until_move: 0,
+                                    interval: *interval,
+                                    move_mouse_accel_state: Some(move_mouse_accel_state),
+                                })
                             }
                         }
-                        CustomAction::MoveMouseSpeed { speed } => {
-                            self.move_mouse_speed_modifiers.push(*speed);
-                            log::debug!(
-                                "movemousespeed modifiers: {:?}",
-                                self.move_mouse_speed_modifiers
-                            );
-                        }
-                        CustomAction::Cmd(_cmd) => {
-                            #[cfg(feature = "cmd")]
-                            cmds.push((
-                                Some(log::Level::Info),
-                                Some(log::Level::Error),
-                                _cmd.clone(),
-                            ));
-                        }
-                        CustomAction::CmdLog(_log_level, _error_log_level, _cmd) => {
-                            #[cfg(feature = "cmd")]
-                            cmds.push((
-                                _log_level.get_level(),
-                                _error_log_level.get_level(),
-                                _cmd.clone(),
-                            ));
-                        }
-                        CustomAction::CmdOutputKeys(_cmd) => {
-                            #[cfg(feature = "cmd")]
-                            {
-                                let cmd = _cmd.clone();
-                                // Maybe improvement in the future:
-                                // A delay here, as in KeyAction::Delay, will pause the entire
-                                // state machine loop. That is _probably_ OK, but ideally this
-                                // would be done in a separate thread or somehow
-                                for key_action in keys_for_cmd_output(&cmd) {
-                                    match key_action {
-                                        KeyAction::Press(osc) => press_key(&mut self.kbd_out, osc)?,
-                                        KeyAction::Release(osc) => {
-                                            release_key(&mut self.kbd_out, osc)?
-                                        }
-                                        KeyAction::Delay(delay) => std::thread::sleep(
-                                            std::time::Duration::from_millis(u64::from(delay)),
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                        CustomAction::PushMessage(_message) => {
-                            log::debug!("Action push-msg");
-                            #[cfg(feature = "tcp_server")]
-                            if let Some(tx) = _tx {
-                                let message = simple_sexpr_to_json_array(_message);
-                                log::debug!("Action push-msg message: {}", message);
-                                match tx.try_send(ServerMessage::MessagePush { message }) {
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        log::error!(
-                                            "could not send {} event notification: {}",
-                                            PUSH_MESSAGE,
-                                            error
-                                        );
-                                    }
-                                }
-                            }
-                            #[cfg(feature = "tcp_server")]
-                            if self.tcp_server_address.is_none() {
-                                log::warn!("{} was used, but TCP server is not running. did you specify a port?", PUSH_MESSAGE);
-                            }
-                            #[cfg(not(feature = "tcp_server"))]
-                            log::warn!(
-                                "{} was used, but Kanata was compiled with TCP server disabled.",
-                                PUSH_MESSAGE
-                            );
-                        }
-                        CustomAction::FakeKey { coord, action } => {
-                            let (x, y) = (coord.x, coord.y);
-                            log::debug!(
-                                "fake key on press   {action:?} {:?},{x:?},{y:?} {:?}",
-                                layout.default_layer,
-                                layout.layers[layout.default_layer][x as usize][y as usize]
-                            );
-                            handle_fakekey_action(*action, layout, x, y);
-                        }
-                        CustomAction::Delay(delay) => {
-                            log::debug!("on-press: sleeping for {delay} ms");
-                            std::thread::sleep(time::Duration::from_millis((*delay).into()));
-                        }
-                        CustomAction::SequenceCancel => {
-                            if let Some(state) = self.sequence_state.get_active() {
-                                log::debug!("pressed cancel sequence key");
-                                cancel_sequence(state, &mut self.kbd_out)?;
-                            }
-                        }
-                        CustomAction::SequenceLeader(timeout, input_mode) => {
-                            if self.sequence_state.is_inactive() {
-                                log::debug!("entering sequence mode");
-                                self.sequence_state.activate(*input_mode, *timeout);
-                            } else if *input_mode == SequenceInputMode::HiddenSuppressed {
-                                log::debug!("retriggering sequence mode");
-                                self.sequence_state.activate(*input_mode, *timeout);
-                            }
-                        }
-                        CustomAction::SequenceNoerase(noerase_count) => {
-                            if let Some(state) = self.sequence_state.get_active() {
-                                log::debug!("pressed cancel sequence key");
-                                add_noerase(state, *noerase_count);
-                            }
-                        }
-                        CustomAction::Repeat => {
-                            let keycode = self.last_pressed_key;
-                            let osc: OsCode = keycode.into();
-                            log::debug!("repeating a keypress {osc:?}");
-                            let mut do_caps_word = false;
-                            if !cur_keys.contains(&KeyCode::LShift)
-                                && let Some(ref mut cw) = self.caps_word {
-                                    cur_keys.push(keycode);
-                                    let prev_len = cur_keys.len();
-                                    cw.tick_maybe_add_lsft(cur_keys);
-                                    if cur_keys.len() > prev_len {
-                                        do_caps_word = true;
-                                        press_key(&mut self.kbd_out, OsCode::KEY_LEFTSHIFT)?;
-                                    }
-                                }
-                            // Release key in case the most recently pressed key is still pressed.
-                            release_key(&mut self.kbd_out, osc)?;
-                            press_key(&mut self.kbd_out, osc)?;
-                            release_key(&mut self.kbd_out, osc)?;
-                            if do_caps_word {
-                                self.kbd_out.release_key(OsCode::KEY_LEFTSHIFT)?;
-                            }
-                        }
-                        CustomAction::DynamicMacroRecord(macro_id) => {
-                            if let Some((macro_id, prev_recorded_macro)) =
-                                begin_record_macro(*macro_id, &mut self.dynamic_macro_record_state)
-                            {
-                                log::debug!("saving macro {prev_recorded_macro:?}");
-                                self.dynamic_macros.insert(macro_id, prev_recorded_macro);
-                            }
-                        }
-                        CustomAction::DynamicMacroRecordStop(num_actions_to_remove) => {
-                            if let Some((macro_id, prev_recorded_macro)) = stop_macro(
-                                &mut self.dynamic_macro_record_state,
-                                *num_actions_to_remove,
-                            ) {
-                                log::debug!("saving macro {prev_recorded_macro:?}");
-                                self.dynamic_macros.insert(macro_id, prev_recorded_macro);
-                            }
-                        }
-                        CustomAction::DynamicMacroPlay(macro_id) => {
-                            play_macro(
-                                *macro_id,
-                                &mut self.dynamic_macro_replay_state,
-                                &self.dynamic_macros,
-                            );
-                        }
-                        CustomAction::CancelMacroOnNextPress(duration) => {
-                            self.macro_on_press_cancel_duration = *duration;
-                        }
-                        CustomAction::SendArbitraryCode(code) => {
-                            #[cfg(all(not(feature = "simulated_output"), target_os = "windows"))]
-                            {
-                                self.kbd_out.write_code_raw(*code, KeyValue::Press)?;
-                            }
-                            #[cfg(any(feature = "simulated_output", not(target_os = "windows")))]
-                            {
-                                self.kbd_out.write_code(*code as u32, KeyValue::Press)?;
-                            }
-                        }
-                        CustomAction::CapsWord(cfg) => match cfg.repress_behaviour {
-                            CapsWordRepressBehaviour::Overwrite => {
-                                log::trace!("caps-word overwrite");
-                                self.caps_word = Some(CapsWordState::new(cfg));
-                            }
-                            CapsWordRepressBehaviour::Toggle => {
-                                log::trace!("caps-word toggle");
-                                self.caps_word = match self.caps_word {
-                                    Some(_) => None,
-                                    None => Some(CapsWordState::new(cfg)),
-                                };
-                            }
-                        },
-                        CustomAction::SetMouse { x, y } => {
-                            self.kbd_out.set_mouse(*x, *y)?;
-                        }
-                        CustomAction::FakeKeyOnIdle(fkd) => {
-                            self.ticks_since_idle = 0;
-                            self.waiting_for_idle.insert(*fkd);
-                        }
-                        CustomAction::FakeKeyOnPhysicalIdle(fkd) => {
-                            self.ticks_since_physical_idle = 0;
-                            self.waiting_for_physical_idle.insert(*fkd);
-                        }
-                        CustomAction::FakeKeyHoldForDuration(fk_hfd) => {
-                            let duration = fk_hfd.hold_duration;
-                            self.vkeys_pending_release.entry(fk_hfd.coord)
-                                .and_modify(|d| *d = duration)
-                                .or_insert_with(|| {
-                                    let Coord { x, y } = fk_hfd.coord;
-                                    layout.event(Event::Press(x, y));
-                                    duration
-                                });
-                        }
-                        CustomAction::ClipboardSet(clipboard_string) => {
-                            clpb_set(clipboard_string);
-                        }
-                        CustomAction::ClipboardCmdSet(cmd_params) => {
-                            clpb_cmd_set(cmd_params);
-                        }
-                        CustomAction::ClipboardSave(id) => {
-                            clpb_save(*id, &mut self.saved_clipboard_content);
-                        }
-                        CustomAction::ClipboardRestore(id) => {
-                            clpb_restore(*id, &self.saved_clipboard_content);
-                        }
-                        CustomAction::ClipboardSaveSet(id, clipboard_string) => {
-                            clpb_save_set(*id, clipboard_string, &mut self.saved_clipboard_content);
-                        }
-                        CustomAction::ClipboardSaveCmdSet(id, cmd_params) => {
-                            clpb_save_cmd_set(*id, cmd_params, &mut self.saved_clipboard_content);
-                        }
-                        CustomAction::ClipboardSaveSwap(id1, id2) => {
-                            clpb_save_swap(*id1, *id2, &mut self.saved_clipboard_content);
-                        }
-                        CustomAction::FakeKeyOnRelease { .. }
-                        | CustomAction::DelayOnRelease(_)
-                        | CustomAction::Unmodded { .. }
-                        | CustomAction::Unshifted { .. }
-                        // Note: ReverseReleaseOrder is already handled earlier on.
-                        | CustomAction::ReverseReleaseOrder
-                        | CustomAction::CancelMacroOnRelease => {}
                     }
+                    CustomAction::MoveMouseSpeed { speed } => {
+                        self.move_mouse_speed_modifiers.push(*speed);
+                        log::debug!(
+                            "movemousespeed modifiers: {:?}",
+                            self.move_mouse_speed_modifiers
+                        );
+                    }
+                    CustomAction::MouseWheelSpeed { speed } => {
+                        self.mousewheel_speed_modifiers.push(*speed);
+                        log::debug!(
+                            "mousewheel speed modifiers: {:?}",
+                            self.mousewheel_speed_modifiers
+                        );
+                    }
+                    CustomAction::Cmd(_cmd) => {
+                        #[cfg(feature = "cmd")]
+                        cmds.push((
+                            Some(log::Level::Info),
+                            Some(log::Level::Error),
+                            Vec::from_iter(_cmd.iter().map(|s| s.to_string())),
+                        ));
+                    }
+                    CustomAction::CmdLog(_log_level, _error_log_level, _cmd) => {
+                        #[cfg(feature = "cmd")]
+                        cmds.push((
+                            _log_level.get_level(),
+                            _error_log_level.get_level(),
+                            Vec::from_iter(_cmd.iter().map(|s| s.to_string())),
+                        ));
+                    }
+                    CustomAction::CmdOutputKeys(_cmd) => {
+                        #[cfg(feature = "cmd")]
+                        {
+                            // Maybe improvement in the future:
+                            // A delay here, as in KeyAction::Delay, will pause the entire
+                            // state machine loop. That is _probably_ OK, but ideally this
+                            // would be done in a separate thread or somehow
+                            for key_action in keys_for_cmd_output(_cmd) {
+                                match key_action {
+                                    KeyAction::Press(osc) => press_key(&mut self.kbd_out, osc)?,
+                                    KeyAction::Release(osc) => {
+                                        release_key(&mut self.kbd_out, osc)?
+                                    }
+                                    KeyAction::Delay(delay) => std::thread::sleep(
+                                        std::time::Duration::from_millis(u64::from(delay)),
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    CustomAction::PushMessage(_message) => {
+                        log::debug!("Action push-msg");
+                        #[cfg(feature = "tcp_server")]
+                        if let Some(tx) = _tx {
+                            let message = simple_sexpr_to_json_array(_message);
+                            log::debug!("Action push-msg message: {}", message);
+                            match tx.try_send(ServerMessage::MessagePush { message }) {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    log::error!(
+                                        "could not send {} event notification: {}",
+                                        PUSH_MESSAGE,
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        #[cfg(feature = "tcp_server")]
+                        if self.tcp_server_address.is_none() {
+                            log::warn!("{} was used, but TCP server is not running. did you specify a port?", PUSH_MESSAGE);
+                        }
+                        #[cfg(not(feature = "tcp_server"))]
+                        log::warn!(
+                            "{} was used, but Kanata was compiled with TCP server disabled.",
+                            PUSH_MESSAGE
+                        );
+                    }
+                    CustomAction::FakeKey { coord, action } => {
+                        let (x, y) = (coord.x, coord.y);
+                        log::debug!(
+                            "fake key on press   {action:?} {:?},{x:?},{y:?} {:?}",
+                            layout.default_layer,
+                            layout.layers[layout.default_layer][x as usize][y as usize]
+                        );
+                        handle_fakekey_action(*action, layout, x, y);
+                    }
+                    CustomAction::Delay(delay) => {
+                        log::debug!("on-press: sleeping for {delay} ms");
+                        std::thread::sleep(time::Duration::from_millis((*delay).into()));
+                    }
+                    CustomAction::SequenceCancel => {
+                        if let Some(state) = self.sequence_state.get_active() {
+                            log::debug!("pressed cancel sequence key");
+                            cancel_sequence(state, &mut self.kbd_out)?;
+                        }
+                    }
+                    CustomAction::SequenceLeader(timeout, input_mode) => {
+                        if self.sequence_state.is_inactive() {
+                            log::debug!("entering sequence mode");
+                            self.sequence_state.activate(*input_mode, *timeout);
+                        } else if *input_mode == SequenceInputMode::HiddenSuppressed {
+                            log::debug!("retriggering sequence mode");
+                            self.sequence_state.activate(*input_mode, *timeout);
+                        }
+                    }
+                    CustomAction::SequenceNoerase(..) => {}
+                    CustomAction::Repeat => {
+                        let keycode = self.last_pressed_key;
+                        let osc: OsCode = keycode.into();
+                        log::debug!("repeating a keypress {osc:?}");
+                        let mut do_caps_word = false;
+                        if !cur_keys.contains(&KeyCode::LShift)
+                            && let Some(ref mut cw) = self.caps_word {
+                                cur_keys.push(keycode);
+                                let prev_len = cur_keys.len();
+                                cw.tick_maybe_add_lsft(cur_keys);
+                                if cur_keys.len() > prev_len {
+                                    do_caps_word = true;
+                                    press_key(&mut self.kbd_out, OsCode::KEY_LEFTSHIFT)?;
+                                }
+                            }
+                        // Release key in case the most recently pressed key is still pressed.
+                        release_key(&mut self.kbd_out, osc)?;
+                        press_key(&mut self.kbd_out, osc)?;
+                        release_key(&mut self.kbd_out, osc)?;
+                        if do_caps_word {
+                            self.kbd_out.release_key(OsCode::KEY_LEFTSHIFT)?;
+                        }
+                    }
+                    CustomAction::DynamicMacroRecord(macro_id) => {
+                        if let Some((macro_id, prev_recorded_macro)) =
+                            begin_record_macro(*macro_id, &mut self.dynamic_macro_record_state)
+                        {
+                            log::debug!("saving macro {prev_recorded_macro:?}");
+                            self.dynamic_macros.insert(macro_id, prev_recorded_macro);
+                        }
+                    }
+                    CustomAction::DynamicMacroRecordStop(num_actions_to_remove) => {
+                        if let Some((macro_id, prev_recorded_macro)) = stop_macro(
+                            &mut self.dynamic_macro_record_state,
+                            *num_actions_to_remove,
+                        ) {
+                            log::debug!("saving macro {prev_recorded_macro:?}");
+                            self.dynamic_macros.insert(macro_id, prev_recorded_macro);
+                        }
+                    }
+                    CustomAction::DynamicMacroPlay(macro_id) => {
+                        play_macro(
+                            *macro_id,
+                            &mut self.dynamic_macro_replay_state,
+                            &self.dynamic_macros,
+                        );
+                    }
+                    CustomAction::CancelMacroOnNextPress(duration) => {
+                        self.macro_on_press_cancel_duration = *duration;
+                    }
+                    CustomAction::SendArbitraryCode(code) => {
+                        #[cfg(all(not(feature = "simulated_output"), target_os = "windows"))]
+                        {
+                            self.kbd_out.write_code_raw(*code, KeyValue::Press)?;
+                        }
+                        #[cfg(any(feature = "simulated_output", not(target_os = "windows")))]
+                        {
+                            self.kbd_out.write_code(*code as u32, KeyValue::Press)?;
+                        }
+                    }
+                    CustomAction::CapsWord(cfg) => match cfg.repress_behaviour {
+                        CapsWordRepressBehaviour::Overwrite => {
+                            log::trace!("caps-word overwrite");
+                            self.caps_word = Some(CapsWordState::new(cfg));
+                        }
+                        CapsWordRepressBehaviour::Toggle => {
+                            log::trace!("caps-word toggle");
+                            self.caps_word = match self.caps_word {
+                                Some(_) => None,
+                                None => Some(CapsWordState::new(cfg)),
+                            };
+                        }
+                    },
+                    CustomAction::SetMouse { x, y } => {
+                        self.kbd_out.set_mouse(*x, *y)?;
+                    }
+                    CustomAction::FakeKeyOnIdle(fkd) => {
+                        self.ticks_since_idle = 0;
+                        self.waiting_for_idle.insert(*fkd);
+                    }
+                    CustomAction::FakeKeyOnPhysicalIdle(fkd) => {
+                        self.ticks_since_physical_idle = 0;
+                        self.waiting_for_physical_idle.insert(*fkd);
+                    }
+                    CustomAction::FakeKeyHoldForDuration(fk_hfd) => {
+                        let duration = fk_hfd.hold_duration;
+                        self.vkeys_pending_release.entry(fk_hfd.coord)
+                            .and_modify(|d| *d = duration)
+                            .or_insert_with(|| {
+                                let Coord { x, y } = fk_hfd.coord;
+                                layout.event(Event::Press(x, y));
+                                duration
+                            });
+                    }
+                    CustomAction::ClipboardSet(clipboard_string) => {
+                        clpb_set(clipboard_string);
+                    }
+                    CustomAction::ClipboardCmdSet(cmd_params) => {
+                        clpb_cmd_set(cmd_params);
+                    }
+                    CustomAction::ClipboardSave(id) => {
+                        clpb_save(*id, &mut self.saved_clipboard_content);
+                    }
+                    CustomAction::ClipboardRestore(id) => {
+                        clpb_restore(*id, &self.saved_clipboard_content);
+                    }
+                    CustomAction::ClipboardSaveSet(id, clipboard_string) => {
+                        clpb_save_set(*id, clipboard_string, &mut self.saved_clipboard_content);
+                    }
+                    CustomAction::ClipboardSaveCmdSet(id, cmd_params) => {
+                        clpb_save_cmd_set(*id, cmd_params, &mut self.saved_clipboard_content);
+                    }
+                    CustomAction::ClipboardSaveSwap(id1, id2) => {
+                        clpb_save_swap(*id1, *id2, &mut self.saved_clipboard_content);
+                    }
+                    CustomAction::FakeKeyOnRelease { .. }
+                    | CustomAction::DelayOnRelease(_)
+                    | CustomAction::Unmodded { .. }
+                    | CustomAction::Unshifted { .. }
+                    | CustomAction::Suppressed { .. }
+                    // Note: ReverseReleaseOrder is already handled earlier on.
+                    | CustomAction::ReverseReleaseOrder
+                    | CustomAction::CancelMacroOnRelease => {}
                 }
                 #[cfg(feature = "cmd")]
                 run_multi_cmd(cmds);
@@ -1752,127 +2156,127 @@ impl Kanata {
                 }
             }
 
-            CustomEvent::Release(custacts) => {
-                // Unclick only the last mouse button
-                if let Some(Err(e)) = custacts
-                    .iter()
-                    .fold(None, |pbtn, ac| match ac {
-                        CustomAction::Mouse(btn) => Some(btn),
-                        CustomAction::MWheel { direction, .. } => {
-                            match direction {
-                                MWheelDirection::Up | MWheelDirection::Down => {
-                                    if let Some(ss) = &self.scroll_state
-                                        && ss.direction == *direction
-                                    {
-                                        self.scroll_state = None;
-                                    }
-                                }
-                                MWheelDirection::Left | MWheelDirection::Right => {
-                                    if let Some(ss) = &self.hscroll_state
-                                        && ss.direction == *direction
-                                    {
-                                        self.hscroll_state = None;
-                                    }
-                                }
-                            }
-                            pbtn
-                        }
-                        CustomAction::MoveMouse { direction, .. }
-                        | CustomAction::MoveMouseAccel { direction, .. } => {
-                            match direction {
-                                MoveDirection::Up | MoveDirection::Down => {
-                                    if let Some(move_mouse_state_vertical) =
-                                        &self.move_mouse_state_vertical
-                                        && move_mouse_state_vertical.direction == *direction
-                                    {
-                                        self.move_mouse_state_vertical = None;
-                                    }
-                                }
-                                MoveDirection::Left | MoveDirection::Right => {
-                                    if let Some(move_mouse_state_horizontal) =
-                                        &self.move_mouse_state_horizontal
-                                        && move_mouse_state_horizontal.direction == *direction
-                                    {
-                                        self.move_mouse_state_horizontal = None;
-                                    }
-                                }
-                            }
-                            if self.movemouse_smooth_diagonals {
-                                self.movemouse_buffer = None
-                            }
-                            pbtn
-                        }
-                        CustomAction::MoveMouseSpeed { speed, .. } => {
-                            if let Some(idx) = self
-                                .move_mouse_speed_modifiers
-                                .iter()
-                                .position(|s| *s == *speed)
-                            {
-                                self.move_mouse_speed_modifiers.remove(idx);
-                            }
-                            log::debug!(
-                                "movemousespeed modifiers: {:?}",
-                                self.move_mouse_speed_modifiers
-                            );
-                            pbtn
-                        }
-                        CustomAction::DelayOnRelease(delay) => {
-                            log::debug!("on-release: sleeping for {delay} ms");
-                            std::thread::sleep(time::Duration::from_millis((*delay).into()));
-                            pbtn
-                        }
-                        CustomAction::FakeKeyOnRelease { coord, action } => {
-                            let (x, y) = (coord.x, coord.y);
-                            log::debug!("fake key on release {action:?} {x:?},{y:?}");
-                            handle_fakekey_action(*action, layout, x, y);
-                            pbtn
-                        }
-                        CustomAction::CancelMacroOnRelease => {
-                            log::debug!("cancelling all macros: releasable macro");
-                            layout.active_sequences.clear();
-                            self.macro_on_press_cancel_duration = 0;
-                            layout.states.retain(|s| {
-                                !matches!(
-                                    s,
-                                    State::FakeKey { .. } | State::RepeatingSequence { .. }
-                                )
-                            });
-                            pbtn
-                        }
-                        CustomAction::SendArbitraryCode(code) => {
-                            if let Err(e) = {
-                                #[cfg(all(
-                                    not(feature = "simulated_output"),
-                                    target_os = "windows"
-                                ))]
-                                {
-                                    self.kbd_out.write_code_raw(*code, KeyValue::Release)
-                                }
-                                #[cfg(any(
-                                    feature = "simulated_output",
-                                    not(target_os = "windows")
-                                ))]
-                                {
-                                    self.kbd_out.write_code(*code as u32, KeyValue::Release)
-                                }
-                            } {
-                                log::error!("failed to release arbitrary code {e:?}");
-                            }
-                            pbtn
-                        }
-                        _ => pbtn,
-                    })
-                    .map(|btn| {
-                        log::debug!("unclick   {:?}", btn);
-                        self.kbd_out.release_btn(*btn)
-                    })
-                {
-                    bail!(e);
+            CustomEvent::Release(custact) => match custact {
+                CustomAction::Mouse(btn) => {
+                    self.kbd_out.release_btn(*btn)?;
                 }
-            }
-            _ => {}
+                CustomAction::MWheel { direction, .. } => {
+                    // As with movement, an axis only tracks one scroll at a
+                    // time, so the released action owns that state only while
+                    // the directions match. Another scroll key on the axis may
+                    // still be held (e.g. up and down both held and down is
+                    // released first); resume that one rather than stopping the
+                    // axis and leaving a held key doing nothing. With nothing
+                    // left holding it, stop as before, which lets an inertial
+                    // scroll decelerate instead of cutting out.
+                    let is_vertical = is_vertical_scroll_direction(*direction);
+                    let axis_state = if is_vertical {
+                        &mut self.scroll_state
+                    } else {
+                        &mut self.hscroll_state
+                    };
+                    if let Some(ss) = axis_state
+                        && ss.direction == *direction
+                    {
+                        match resume_scroll_on_axis(&layout.states, is_vertical) {
+                            Some(resumed) => *ss = resumed,
+                            None => {
+                                ss.distance = 0;
+                                if let Some(acs) = &mut ss.scroll_accel_state {
+                                    acs.scroll_released = true
+                                }
+                            }
+                        }
+                    }
+                }
+                CustomAction::MoveMouse { direction, .. }
+                | CustomAction::MoveMouseAccel { direction, .. } => {
+                    // An axis only tracks one movement at a time, so the
+                    // released action is only the owner of that state if the
+                    // directions still match. When it is the owner, another
+                    // movement key on the same axis may still be held (e.g.
+                    // left and right both held and right is released first);
+                    // resume that one instead of stopping the axis, which
+                    // would leave a held key doing nothing until re-pressed.
+                    let is_vertical = is_vertical_move_direction(*direction);
+                    let axis_state = if is_vertical {
+                        &mut self.move_mouse_state_vertical
+                    } else {
+                        &mut self.move_mouse_state_horizontal
+                    };
+                    if axis_state
+                        .as_ref()
+                        .is_some_and(|s| s.direction == *direction)
+                    {
+                        *axis_state = resume_move_mouse_on_axis(&layout.states, is_vertical);
+                    }
+                    if self.movemouse_smooth_diagonals {
+                        self.movemouse_buffer = None
+                    }
+                }
+                CustomAction::MoveMouseSpeed { speed, .. } => {
+                    if let Some(idx) = self
+                        .move_mouse_speed_modifiers
+                        .iter()
+                        .position(|s| *s == *speed)
+                    {
+                        self.move_mouse_speed_modifiers.remove(idx);
+                    }
+                    log::debug!(
+                        "movemousespeed modifiers: {:?}",
+                        self.move_mouse_speed_modifiers
+                    );
+                }
+                CustomAction::MouseWheelSpeed { speed } => {
+                    if let Some(idx) = self
+                        .mousewheel_speed_modifiers
+                        .iter()
+                        .position(|s| *s == *speed)
+                    {
+                        self.mousewheel_speed_modifiers.remove(idx);
+                    }
+                    log::debug!(
+                        "mousewheel speed modifiers: {:?}",
+                        self.mousewheel_speed_modifiers
+                    );
+                }
+                CustomAction::DelayOnRelease(delay) => {
+                    log::debug!("on-release: sleeping for {delay} ms");
+                    std::thread::sleep(time::Duration::from_millis((*delay).into()));
+                }
+                CustomAction::FakeKeyOnRelease { coord, action } => {
+                    let (x, y) = (coord.x, coord.y);
+                    log::debug!("fake key on release {action:?} {x:?},{y:?}");
+                    handle_fakekey_action(*action, layout, x, y);
+                }
+                CustomAction::CancelMacroOnRelease => {
+                    log::debug!("cancelling all macros: releasable macro");
+                    layout.active_sequences.clear();
+                    self.macro_on_press_cancel_duration = 0;
+                    layout.states.retain(|s| {
+                        !matches!(s, State::FakeKey { .. } | State::RepeatingSequence { .. })
+                    });
+                }
+                CustomAction::SendArbitraryCode(code) => {
+                    if let Err(e) = {
+                        #[cfg(all(not(feature = "simulated_output"), target_os = "windows"))]
+                        {
+                            self.kbd_out.write_code_raw(*code, KeyValue::Release)
+                        }
+                        #[cfg(any(feature = "simulated_output", not(target_os = "windows")))]
+                        {
+                            self.kbd_out.write_code(*code as u32, KeyValue::Release)
+                        }
+                    } {
+                        log::error!("failed to release arbitrary code {e:?}");
+                    }
+                }
+                _ => {}
+            },
+            CustomEvent::NoEvent => {}
         };
 
+        self.check_handle_layer_change(_tx);
         self.check_release_non_physical_shift()?;
         Ok(live_reload_requested)
     }
@@ -1906,20 +2310,20 @@ impl Kanata {
         use kanata_tcp_protocol::ClientMessage;
 
         match command {
-            ClientMessage::Reload {} => {
+            ClientMessage::Reload { .. } => {
                 self.request_live_reload();
                 Ok(())
             }
-            ClientMessage::ReloadNext {} => {
+            ClientMessage::ReloadNext { .. } => {
                 self.request_live_reload_next();
                 Ok(())
             }
-            ClientMessage::ReloadPrev {} => {
+            ClientMessage::ReloadPrev { .. } => {
                 self.request_live_reload_prev();
                 Ok(())
             }
-            ClientMessage::ReloadNum { index } => self.request_live_reload_num(index),
-            ClientMessage::ReloadFile { path } => self.request_live_reload_file(path),
+            ClientMessage::ReloadNum { index, .. } => self.request_live_reload_num(index),
+            ClientMessage::ReloadFile { path, .. } => self.request_live_reload_file(path),
             _ => {
                 // For non-reload commands, we don't validate here - they're handled directly in tcp_server
                 Ok(())
@@ -2015,9 +2419,32 @@ impl Kanata {
     }
 
     fn print_layer(&self, layer: usize) {
-        if self.log_layer_changes {
+        if !self.log_layer_changes {
+            return;
+        }
+        if self.log_layer_changes_name_only {
+            log::info!("Entered layer: {}", self.layer_info[layer].name);
+        } else {
             log::info!("Entered layer:\n\n{}", self.layer_info[layer].cfg_text);
         }
+    }
+
+    #[cfg(feature = "tcp_server")]
+    /// Get engine uptime in seconds
+    pub fn get_uptime_s(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
+    }
+
+    #[cfg(feature = "tcp_server")]
+    /// Check if a reload has completed (regardless of success or failure)
+    pub fn is_reload_complete(&self) -> bool {
+        !self.live_reload_requested
+    }
+
+    #[cfg(feature = "tcp_server")]
+    /// Whether the most recent reload succeeded.
+    pub fn last_reload_succeeded(&self) -> bool {
+        self.last_reload_ok
     }
 
     #[cfg(feature = "tcp_server")]
@@ -2078,6 +2505,26 @@ impl Kanata {
     ) {
         info!("entering the processing loop");
         std::thread::spawn(move || {
+            // Elevate the processing thread to the highest QoS class so that
+            // CPU-intensive background work (compilation, indexing, etc.) does
+            // not starve the 1 ms tick loop. Without this, delayed key-release
+            // processing causes the OS to autorepeat keys that the user has
+            // already released physically. Windows does the equivalent with
+            // REALTIME_PRIORITY_CLASS (see new() above).
+            #[cfg(target_os = "macos")]
+            {
+                let rc = unsafe {
+                    libc::pthread_set_qos_class_self_np(
+                        libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                        0,
+                    )
+                };
+                if rc == 0 {
+                    info!("macOS: processing thread QoS set to USER_INTERACTIVE");
+                } else {
+                    log::warn!("macOS: failed to set processing thread QoS (rc={rc})");
+                }
+            }
             if !nodelay {
                 info!("Init: catching only releases and sending immediately");
                 for _ in 0..500 {
@@ -2086,7 +2533,12 @@ impl Kanata {
                     {
                         let mut k = kanata.lock();
                         info!("Init: releasing {:?}", kev.code);
-                        k.kbd_out.release_key(kev.code).expect("key released");
+                        // Through `output_logic`, not `KbdOut` directly: this
+                        // drain runs while the controller backend is already
+                        // delivering, and a pad code has no scancode for the
+                        // OS layer to emit. On macOS writing one is an `Err`
+                        // that the `expect` below would turn into a panic.
+                        release_key(&mut k.kbd_out, kev.code).expect("key released");
                     }
                     std::thread::sleep(time::Duration::from_millis(1));
                 }
@@ -2106,6 +2558,7 @@ impl Kanata {
             #[cfg(all(not(feature = "interception_driver"), target_os = "windows"))]
             let mut last_input_time = web_time::Instant::now();
 
+            let mut events = Vec::new();
             let err = loop {
                 let can_block = {
                     let mut k = kanata.lock();
@@ -2122,6 +2575,8 @@ impl Kanata {
                     log::trace!("blocking on channel");
                     match rx.recv() {
                         Ok(kev) => {
+                            collect_and_sort_events(kev, &rx, &mut events);
+
                             let mut k = kanata.lock();
                             let now = web_time::Instant::now()
                                 .checked_sub(time::Duration::from_millis(1))
@@ -2153,7 +2608,14 @@ impl Kanata {
                             #[cfg(feature = "perf_logging")]
                             let start = web_time::Instant::now();
 
-                            if let Err(e) = k.handle_input_event(&kev) {
+                            let mut event_error = None;
+                            for ev in &events {
+                                if let Err(e) = k.handle_input_event(ev) {
+                                    event_error = Some(e);
+                                    break;
+                                }
+                            }
+                            if let Some(e) = event_error {
                                 break e;
                             }
                             #[cfg(all(
@@ -2196,9 +2658,11 @@ impl Kanata {
                         }
                     }
                 } else {
-                    let mut k = kanata.lock();
                     match rx.try_recv() {
                         Ok(kev) => {
+                            collect_and_sort_events(kev, &rx, &mut events);
+
+                            let mut k = kanata.lock();
                             // Check for live reload BEFORE processing the key event
                             if k.live_reload_requested
                                 && ((k.prev_keys.is_empty() && k.cur_keys.is_empty())
@@ -2213,7 +2677,14 @@ impl Kanata {
                             #[cfg(feature = "perf_logging")]
                             let start = web_time::Instant::now();
 
-                            if let Err(e) = k.handle_input_event(&kev) {
+                            let mut event_error = None;
+                            for ev in &events {
+                                if let Err(e) = k.handle_input_event(ev) {
+                                    event_error = Some(e);
+                                    break;
+                                }
+                            }
+                            if let Some(e) = event_error {
                                 break e;
                             }
                             #[cfg(all(
@@ -2251,6 +2722,8 @@ impl Kanata {
                             );
                         }
                         Err(TryRecvError::Empty) => {
+                            let mut k = kanata.lock();
+
                             #[cfg(feature = "perf_logging")]
                             let start = web_time::Instant::now();
 
@@ -2326,13 +2799,13 @@ impl Kanata {
         // NOTE: this check must not be part of `is_idle` because its falsiness
         // does not mean that kanata is in a non-idle state, just that we
         // haven't done enough ticks yet to properly compute key-timing.
-        let passed_max_switch_timing_check = k
+        let passed_max_timing_check = k
             .layout
             .b()
             .historical_keys
             .iter_hevents()
             .next()
-            .map(|he| he.ticks_since_occurrence >= k.switch_max_key_timing)
+            .map(|he| he.ticks_since_occurrence >= k.max_key_timing_check)
             .unwrap_or(true);
         let chordsv2_accepts_chords = k
             .layout
@@ -2344,21 +2817,26 @@ impl Kanata {
         is_idle
             && !counting_idle_ticks
             && !counting_physical_idle_ticks
-            && passed_max_switch_timing_check
+            && passed_max_timing_check
             && chordsv2_accepts_chords
     }
 
     pub fn is_idle(&self) -> bool {
         let pressed_keys_means_not_idle =
             !self.waiting_for_idle.is_empty() || self.live_reload_requested;
-        self.layout.b().queue.is_empty()
+        if self.gamepad_moving || self.gamepad_debounce_pending {
+            return false;
+        }
+        let layout = self.layout.b();
+        layout.queue.is_empty()
             && zippy_is_idle()
-            && self.layout.b().waiting.is_none()
-            && self.layout.b().last_press_tracker.tap_hold_timeout == 0
-            && (self.layout.b().oneshot.timeout == 0 || self.layout.b().oneshot.keys.is_empty())
-            && self.layout.b().active_sequences.is_empty()
-            && self.layout.b().tap_dance_eager.is_none()
-            && self.layout.b().action_queue.is_empty()
+            && layout.waiting.is_none()
+            && layout.last_press_tracker.tap_hold_timeout == 0
+            && (layout.oneshot.timeout == 0 || layout.oneshot.keys.is_empty())
+            && layout.active_sequences.is_empty()
+            && layout.tap_dance_eager.is_none()
+            && layout.action_queue.is_empty()
+            && layout.custom_event_release_queue.is_empty()
             && self.sequence_state.is_inactive()
             && self.scroll_state.is_none()
             && self.hscroll_state.is_none()
@@ -2368,13 +2846,11 @@ impl Kanata {
             && self.dynamic_macro_replay_state.is_none()
             && self.caps_word.is_none()
             && self.vkeys_pending_release.is_empty()
-            && !self.layout.b().states.iter().any(|s| {
+            && !layout.states.iter().any(|s| {
                 matches!(s, State::SeqCustomPending(_) | State::SeqCustomActive(_))
                     || (pressed_keys_means_not_idle && matches!(s, State::NormalKey { .. }))
             })
-            && self
-                .layout
-                .b()
+            && layout
                 .chords_v2
                 .as_ref()
                 .map(|cv2| cv2.is_idle_chv2())
@@ -2397,6 +2873,123 @@ fn run_multi_cmd(cmds: Vec<(Option<log::Level>, Option<log::Level>, Vec<String>)
             }
         }
     });
+}
+
+/// Returns true if the two directions are exact opposites on the same axis
+/// (up/down or left/right).
+fn is_opposite_move_direction(a: MoveDirection, b: MoveDirection) -> bool {
+    use MoveDirection::*;
+    matches!(
+        (a, b),
+        (Up, Down) | (Down, Up) | (Left, Right) | (Right, Left)
+    )
+}
+
+/// Builds the movement state to resume on an axis from the most recently
+/// pressed movement action that is still held on it, if there is one. States
+/// are in press order, so the last match is the newest. Acceleration restarts
+/// from the minimum distance: the speed of the movement that just ended must
+/// not carry over into the resumed one.
+fn resume_move_mouse_on_axis<'a>(
+    states: &[State<'a, &'a CustomAction>],
+    is_vertical: bool,
+) -> Option<MoveMouseState> {
+    states.iter().rev().find_map(|state| {
+        let State::Custom { value, .. } = state else {
+            return None;
+        };
+        match **value {
+            CustomAction::MoveMouse {
+                direction,
+                interval,
+                distance,
+            } if is_vertical_move_direction(*direction) == is_vertical => Some(MoveMouseState {
+                direction: *direction,
+                distance: *distance,
+                ticks_until_move: 0,
+                interval: *interval,
+                move_mouse_accel_state: None,
+            }),
+            CustomAction::MoveMouseAccel {
+                direction,
+                interval,
+                accel_time,
+                min_distance,
+                max_distance,
+            } if is_vertical_move_direction(*direction) == is_vertical => Some(MoveMouseState {
+                direction: *direction,
+                distance: *min_distance,
+                ticks_until_move: 0,
+                interval: *interval,
+                move_mouse_accel_state: Some(MoveMouseAccelState {
+                    accel_ticks_from_min: 0,
+                    accel_ticks_until_max: *accel_time,
+                    accel_increment: (f64::from(*max_distance) - f64::from(*min_distance))
+                        / f64::from(*accel_time),
+                    min_distance: *min_distance,
+                    max_distance: *max_distance,
+                }),
+            }),
+            _ => None,
+        }
+    })
+}
+
+/// Builds the scroll state to resume on an axis from the most recently pressed
+/// scroll action that is still held on it, if there is one. States are in press
+/// order, so the last match is the newest.
+fn resume_scroll_on_axis<'a>(
+    states: &[State<'a, &'a CustomAction>],
+    is_vertical: bool,
+) -> Option<ScrollState> {
+    states.iter().rev().find_map(|state| {
+        let State::Custom { value, .. } = state else {
+            return None;
+        };
+        match **value {
+            CustomAction::MWheel {
+                direction,
+                interval,
+                distance,
+                inertial_scroll_params,
+            } if is_vertical_scroll_direction(*direction) == is_vertical => Some(new_scroll_state(
+                *direction,
+                *interval,
+                *distance,
+                *inertial_scroll_params,
+            )),
+            _ => None,
+        }
+    })
+}
+
+fn new_scroll_state(
+    direction: MWheelDirection,
+    interval: u16,
+    distance: u16,
+    inertial_scroll_params: Option<&'static MWheelInertial>,
+) -> ScrollState {
+    ScrollState {
+        direction,
+        distance,
+        ticks_until_scroll: 0,
+        interval,
+        scroll_accel_state: inertial_scroll_params.map(|isp| ScrollAccelState {
+            deceleration_multiplier: isp.deceleration_multiplier.0,
+            acceleration_multiplier: isp.acceleration_multiplier.0,
+            max_velocity: isp.maximum_velocity.0,
+            current_velocity: isp.initial_velocity.0,
+            scroll_released: false,
+        }),
+    }
+}
+
+fn is_vertical_scroll_direction(direction: MWheelDirection) -> bool {
+    matches!(direction, MWheelDirection::Up | MWheelDirection::Down)
+}
+
+fn is_vertical_move_direction(direction: MoveDirection) -> bool {
+    matches!(direction, MoveDirection::Up | MoveDirection::Down)
 }
 
 fn apply_mouse_distance_modifiers(initial_distance: u16, mods: &Vec<u16>) -> u16 {
@@ -2451,12 +3044,25 @@ pub fn clean_state(kanata: &Arc<Mutex<Kanata>>, tick: u128) -> Result<()> {
     let layout = k.layout.bm();
     #[cfg(all(not(feature = "interception_driver"), target_os = "windows"))]
     release_normalkey_states(layout);
+    // Controller input never enters PRESSED_KEYS — it arrives on the channel
+    // rather than from the OS hook — so the sweep below cannot reach a control
+    // a pad is holding. Release those from the engine that does know.
+    {
+        let mut edges = Vec::new();
+        if let Some(gamepad) = &mut k.gamepad {
+            gamepad.release_all(&mut edges);
+        }
+        k.apply_gamepad_edges(&edges)?;
+    }
     k.tick_ms(tick, &None)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let mut k_pressed = PRESSED_KEYS.lock();
         for key_os in k_pressed.clone() {
+            #[cfg(not(all(target_os = "windows", not(feature = "interception_driver"))))]
             k.kbd_out.release_key(key_os)?;
+            #[cfg(all(target_os = "windows", not(feature = "interception_driver")))]
+            k.kbd_out.release_key(key_os.0)?;
         }
         k_pressed.clear();
     }
@@ -2497,23 +3103,61 @@ fn check_for_exit(_event: &KeyEvent) {
                 // from a thread that has no access to the main one, so
                 // can't stop main thread's dispatch
             }
-            #[cfg(all(
-                not(target_os = "linux"),
-                not(all(target_os = "windows", feature = "gui"))
-            ))]
+            // macOS: use `libc::_exit` instead of `std::process::exit` to
+            // skip C++ static destructors. The underlying pqrs shared
+            // dispatcher (used by the karabiner-driverkit crate) has a
+            // teardown race where its destructor kills its own worker
+            // threads while they still hold a `std::mutex`, which then
+            // throws `std::system_error: mutex lock failed` on
+            // `pthread_mutex_destroy`. That exception is uncaught and
+            // aborts the process with a cryptic libc++abi message right
+            // after the user's kill chord. `_exit` bypasses the whole
+            // mess by jumping straight to the kernel exit syscall.
+            //
+            // Flush stdio first so any buffered log output (including the
+            // "exiting" line we just emitted) actually reaches the user.
+            #[cfg(target_os = "macos")]
             {
-                panic!("{EXIT_MSG}");
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                let _ = std::io::stdout().flush();
+                let code = EMERGENCY_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
+                // SAFETY: `_exit` has no preconditions; it terminates the
+                // process immediately without running user destructors.
+                unsafe {
+                    libc::_exit(code);
+                }
             }
-            #[cfg(target_os = "linux")]
+            // Linux/Android: Use SIGTERM to trigger signal handler for cleanup
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             {
                 signal_hook::low_level::raise(signal_hook::consts::SIGTERM).expect("raise signal");
+            }
+            // Windows non-GUI: Direct exit (no cleanup needed)
+            #[cfg(all(target_os = "windows", not(feature = "gui")))]
+            {
+                let code = EMERGENCY_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
+                std::process::exit(code);
+            }
+            // Unsupported platforms: panic to indicate emergency exit isn't implemented
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "android",
+                target_os = "windows"
+            )))]
+            {
+                panic!("{EXIT_MSG}");
             }
         }
     }
 }
 
 fn update_kbd_out(_cfg: &CfgOptions, _kbd_out: &KbdOut) -> Result<()> {
-    #[cfg(all(not(feature = "simulated_output"), target_os = "linux"))]
+    #[cfg(all(
+        not(feature = "simulated_output"),
+        any(target_os = "linux", target_os = "android")
+    ))]
     {
         _kbd_out.update_unicode_termination(_cfg.linux_opts.linux_unicode_termination);
         _kbd_out.update_unicode_u_code(_cfg.linux_opts.linux_unicode_u_code);
@@ -2530,10 +3174,16 @@ pub fn handle_fakekey_action<'a, const C: usize, const R: usize, T>(
     T: 'a + std::fmt::Debug + Copy,
 {
     match action {
-        FakeKeyAction::Press => layout.event(Event::Press(x, y)),
+        FakeKeyAction::Press => {
+            if !states_has_coord(&layout.states, x, y) {
+                layout.event(Event::Press(x, y))
+            }
+        }
         FakeKeyAction::Release => layout.event(Event::Release(x, y)),
         FakeKeyAction::Tap => {
-            layout.event(Event::Press(x, y));
+            if !states_has_coord(&layout.states, x, y) {
+                layout.event(Event::Press(x, y));
+            }
             layout.event(Event::Release(x, y));
         }
         FakeKeyAction::Toggle => {
@@ -2550,8 +3200,12 @@ fn states_has_coord<T>(states: &[State<T>], x: u8, y: u16) -> bool {
         State::NormalKey { coord, .. }
         | State::LayerModifier { coord, .. }
         | State::Custom { coord, .. }
+        | State::NoOpInput { coord }
         | State::RepeatingSequence { coord, .. } => *coord == (x, y),
-        _ => false,
+        State::FakeKey { .. }
+        | State::SeqCustomPending(_)
+        | State::SeqCustomActive(_)
+        | State::Tombstone => false,
     })
 }
 
@@ -2586,5 +3240,298 @@ where
     }
     for coord in coords_to_release.into_iter() {
         layout.event(Event::Release(coord.0, coord.1));
+    }
+}
+
+#[cfg(test)]
+mod collect_and_sort_events_tests {
+    use super::*;
+    use kanata_parser::keys::OsCode;
+    use std::sync::mpsc::sync_channel;
+
+    fn make_event(code: OsCode, value: KeyValue) -> KeyEvent {
+        KeyEvent::new(code, value)
+    }
+
+    #[test]
+    fn single_event_unchanged() {
+        let (_tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Press);
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].code, OsCode::KEY_A);
+    }
+
+    #[test]
+    fn modifiers_first_on_press() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Press);
+        tx.send(make_event(OsCode::KEY_LEFTCTRL, KeyValue::Press))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_B, KeyValue::Press)).unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].code, OsCode::KEY_LEFTCTRL);
+        assert_eq!(result[1].code, OsCode::KEY_A);
+        assert_eq!(result[2].code, OsCode::KEY_B);
+    }
+
+    #[test]
+    fn modifiers_last_on_release() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Release);
+        tx.send(make_event(OsCode::KEY_LEFTCTRL, KeyValue::Release))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_B, KeyValue::Release))
+            .unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].code, OsCode::KEY_A);
+        assert_eq!(result[1].code, OsCode::KEY_B);
+        assert_eq!(result[2].code, OsCode::KEY_LEFTCTRL);
+    }
+
+    #[test]
+    fn multiple_modifiers_on_press() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Press);
+        tx.send(make_event(OsCode::KEY_LEFTCTRL, KeyValue::Press))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_LEFTSHIFT, KeyValue::Press))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_B, KeyValue::Press)).unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].code, OsCode::KEY_LEFTCTRL);
+        assert_eq!(result[1].code, OsCode::KEY_LEFTSHIFT);
+        assert_eq!(result[2].code, OsCode::KEY_A);
+        assert_eq!(result[3].code, OsCode::KEY_B);
+    }
+
+    #[test]
+    fn multiple_modifiers_on_release() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Release);
+        tx.send(make_event(OsCode::KEY_LEFTCTRL, KeyValue::Release))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_LEFTSHIFT, KeyValue::Release))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_B, KeyValue::Release))
+            .unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].code, OsCode::KEY_A);
+        assert_eq!(result[1].code, OsCode::KEY_B);
+        assert_eq!(result[2].code, OsCode::KEY_LEFTCTRL);
+        assert_eq!(result[3].code, OsCode::KEY_LEFTSHIFT);
+    }
+
+    #[test]
+    fn repeat_treated_like_press() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Repeat);
+        tx.send(make_event(OsCode::KEY_LEFTCTRL, KeyValue::Repeat))
+            .unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].code, OsCode::KEY_LEFTCTRL);
+        assert_eq!(result[1].code, OsCode::KEY_A);
+    }
+
+    #[test]
+    fn all_modifiers_no_reorder_needed() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_LEFTCTRL, KeyValue::Press);
+        tx.send(make_event(OsCode::KEY_LEFTSHIFT, KeyValue::Press))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_LEFTALT, KeyValue::Press))
+            .unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].code, OsCode::KEY_LEFTCTRL);
+        assert_eq!(result[1].code, OsCode::KEY_LEFTSHIFT);
+        assert_eq!(result[2].code, OsCode::KEY_LEFTALT);
+    }
+
+    #[test]
+    fn all_non_modifiers_no_reorder_needed() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Press);
+        tx.send(make_event(OsCode::KEY_B, KeyValue::Press)).unwrap();
+        tx.send(make_event(OsCode::KEY_C, KeyValue::Press)).unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].code, OsCode::KEY_A);
+        assert_eq!(result[1].code, OsCode::KEY_B);
+        assert_eq!(result[2].code, OsCode::KEY_C);
+    }
+
+    #[test]
+    fn mixed_press_release_preserves_interleaving() {
+        let (tx, rx) = sync_channel::<KeyEvent>(10);
+        let first = make_event(OsCode::KEY_A, KeyValue::Press);
+        tx.send(make_event(OsCode::KEY_LEFTCTRL, KeyValue::Release))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_B, KeyValue::Release))
+            .unwrap();
+        tx.send(make_event(OsCode::KEY_LEFTSHIFT, KeyValue::Press))
+            .unwrap();
+
+        let mut result = Vec::new();
+        collect_and_sort_events(first, &rx, &mut result);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].code, OsCode::KEY_A);
+        assert_eq!(result[1].code, OsCode::KEY_B);
+        assert_eq!(result[2].code, OsCode::KEY_LEFTCTRL);
+        assert_eq!(result[3].code, OsCode::KEY_LEFTSHIFT);
+    }
+}
+
+#[cfg(all(test, feature = "tcp_server"))]
+mod tcp_layer_change_tests {
+    use super::*;
+    use std::sync::mpsc::{TryRecvError, sync_channel};
+    use std::time::Duration;
+
+    fn collect_layer_changes(rx: &Receiver<ServerMessage>) -> Vec<String> {
+        let mut changes = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(ServerMessage::LayerChange { new }) => changes.push(new),
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn direct_held_layer_press_and_release_emit_layer_changes() {
+        let _lk = match crate::tests::CFG_PARSE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut k = Kanata::new_from_str(
+            r"
+(defsrc a)
+(deflayer base
+  (layer-while-held nav))
+(deflayer nav
+  b)
+            ",
+            Default::default(),
+        )
+        .expect("failed to parse cfg");
+        let (tx, rx) = sync_channel::<ServerMessage>(10);
+        let tx = Some(tx);
+
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_A, KeyValue::Press))
+            .expect("press should succeed");
+        k.last_tick = web_time::Instant::now() - Duration::from_millis(1);
+        k.handle_time_ticks(&tx).expect("press tick should succeed");
+
+        assert_eq!(collect_layer_changes(&rx), vec!["nav"]);
+
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_A, KeyValue::Release))
+            .expect("release should succeed");
+        k.last_tick = web_time::Instant::now() - Duration::from_millis(1);
+        k.handle_time_ticks(&tx)
+            .expect("release tick should succeed");
+
+        assert_eq!(collect_layer_changes(&rx), vec!["base"]);
+    }
+
+    #[test]
+    fn oneshot_held_layer_timeout_emits_both_transitions_within_one_tick_batch() {
+        let _lk = match crate::tests::CFG_PARSE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut k = Kanata::new_from_str(
+            r"
+(defsrc a)
+(deflayer base
+  (one-shot 2 (layer-while-held nav)))
+(deflayer nav
+  b)
+            ",
+            Default::default(),
+        )
+        .expect("failed to parse cfg");
+        let (tx, rx) = sync_channel::<ServerMessage>(10);
+        let tx = Some(tx);
+
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_A, KeyValue::Press))
+            .expect("press should succeed");
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_A, KeyValue::Release))
+            .expect("release should succeed");
+        k.last_tick = web_time::Instant::now() - Duration::from_millis(5);
+        k.handle_time_ticks(&tx)
+            .expect("batched timeout ticks should succeed");
+
+        assert_eq!(collect_layer_changes(&rx), vec!["nav", "base"]);
+    }
+
+    #[test]
+    fn oneshot_held_layer_consumed_by_keypress_emits_both_transitions_within_one_tick_batch() {
+        let _lk = match crate::tests::CFG_PARSE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut k = Kanata::new_from_str(
+            r"
+(defsrc a b)
+(deflayer base
+  (one-shot 20 (layer-while-held nav))
+  XX)
+(deflayer nav
+  _
+  (layer-while-held base))
+            ",
+            Default::default(),
+        )
+        .expect("failed to parse cfg");
+        let (tx, rx) = sync_channel::<ServerMessage>(10);
+        let tx = Some(tx);
+
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_A, KeyValue::Press))
+            .expect("oneshot press should succeed");
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_A, KeyValue::Release))
+            .expect("oneshot release should succeed");
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_B, KeyValue::Press))
+            .expect("consumer press should succeed");
+        k.handle_input_event(&KeyEvent::new(OsCode::KEY_B, KeyValue::Release))
+            .expect("consumer release should succeed");
+        k.last_tick = web_time::Instant::now() - Duration::from_millis(5);
+        k.handle_time_ticks(&tx)
+            .expect("batched consume ticks should succeed");
+
+        assert_eq!(collect_layer_changes(&rx), vec!["nav", "base"]);
     }
 }

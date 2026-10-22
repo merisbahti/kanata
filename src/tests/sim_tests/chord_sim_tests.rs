@@ -81,14 +81,46 @@ static SIMPLE_OVERLAPPING_CHORD_CFG: &str = "\
 
 #[test]
 fn sim_chord_overlapping_timeout() {
-    let result = simulate(SIMPLE_OVERLAPPING_CHORD_CFG, "d:a d:b t:201 d:z t:300");
-    assert_eq!(
-        "t:200ms
-out:↓C
-t:252ms
-out:↓Z",
-        result
-    );
+    let result = simulate(SIMPLE_OVERLAPPING_CHORD_CFG, "d:a d:b t:201 d:z t:500").to_ascii();
+    assert_eq!("t:400ms dn:D", result);
+}
+
+#[test]
+fn sim_chord_overlapping_timeout_v2() {
+    let result = simulate(
+        "
+(defcfg process-unmapped-keys yes
+ concurrent-tap-hold yes)
+(defsrc e f j)
+(deflayermap (layer1))
+(defchordsv2
+ (e f) lctl 5 all-released ()
+ (f j) ret  10 first-release ()
+)
+        ",
+        "d:f t:7 d:j t:100",
+    )
+    .to_ascii();
+    assert_eq!("t:7ms dn:Enter", result);
+}
+
+#[test]
+fn sim_chord_pending_can_still_evaluate_to_individual() {
+    let result = simulate(
+        "
+(defcfg process-unmapped-keys yes
+ concurrent-tap-hold yes)
+(defsrc e f j)
+(deflayermap (layer1))
+(defchordsv2
+ (e f) lctl 5 all-released ()
+ (e f j) lsft 10 all-released ()
+)
+        ",
+        "d:e t:7 d:f t:15",
+    )
+    .to_ascii();
+    assert_eq!("t:11ms dn:E t:1ms dn:F", result);
 }
 
 #[test]
@@ -96,8 +128,9 @@ fn sim_chord_overlapping_release() {
     let result = simulate(
         SIMPLE_OVERLAPPING_CHORD_CFG,
         "d:a d:b t:100 u:a d:z t:300 u:b t:300",
-    );
-    assert_eq!("t:100ms\nout:↓C\nt:251ms\nout:↓Z\nt:51ms\nout:↑C", result);
+    )
+    .to_ascii();
+    assert_eq!("t:100ms dn:C t:401ms dn:Z t:3ms up:C", result);
 }
 
 #[test]
@@ -107,7 +140,7 @@ fn sim_presses_for_old_chord_repress_into_new_chord() {
         "d:a d:b t:50 u:a t:50 d:z t:50 u:b t:50 d:a d:b t:50 u:a t:50",
     )
     .to_ascii();
-    assert_eq!("t:50ms dn:C t:101ms up:C t:99ms dn:D t:11ms up:D", result);
+    assert_eq!("t:50ms dn:C t:200ms dn:D t:11ms up:C t:1ms up:D", result);
 }
 
 #[test]
@@ -293,8 +326,7 @@ fn sim_chord_eager_tapholdpress_activation() {
     )
     .to_ascii();
     assert_eq!(
-        "t:11ms dn:LCtrl t:7ms dn:BSpace t:92ms \
-         dn:BSpace t:10ms dn:BSpace t:14ms up:BSpace t:96ms up:LCtrl",
+        "t:12ms dn:LCtrl t:7ms dn:BSpace t:91ms dn:BSpace t:10ms dn:BSpace t:15ms up:BSpace t:95ms up:LCtrl",
         result
     );
 }
@@ -303,19 +335,32 @@ fn sim_chord_eager_tapholdpress_activation() {
 fn sim_chord_eager_tapholdrelease_activation() {
     let result = simulate(
         "
-    (defcfg concurrent-tap-hold yes)
-    (defsrc caps j k bspc)
-    (deflayer one (tap-hold-release 0 200 esc lctl) j k bspc)
-    (defvirtualkeys bspc bspc)
-    (defchordsv2
-      (j k) (multi (on-press press-vkey bspc) (on-release release-vkey bspc)) 75 first-release ()
-    )
+(defcfg concurrent-tap-hold yes)
+(defsrc)
+(deflayermap (base)
+  caps (tap-hold-release 0 200 esc lctl))
+
+;; defines a vkey named v-$key, example v-bspc
+;; and an alias @v-bspc that press and and releases the v-key
+;; within on-press and on-release respectively.
+(deftemplate v- (key)
+  (defvirtualkeys (concat v- $key) $key)
+  (defalias (concat v- $key)
+    (multi (on-press press-vkey (concat v- $key)) (on-release release-vkey (concat v- $key))))
+)
+
+(t! v- bspc)
+(t! v- del)
+(defchordsv2
+  (j k) @v-bspc 75 first-release ()
+  (s d) @v-del 75 first-release ()
+)
         ",
         "d:caps t:10 d:j d:k t:10 u:j u:k t:100 u:caps t:1000",
     )
     .to_ascii();
     assert_eq!(
-        "t:20ms dn:LCtrl t:7ms dn:BSpace t:5ms up:BSpace t:88ms up:LCtrl",
+        "t:20ms dn:LCtrl t:7ms dn:BSpace t:6ms up:BSpace t:87ms up:LCtrl",
         result
     );
 }
@@ -427,6 +472,93 @@ fn sim_chord_timeout_events() {
     .to_ascii();
     assert_eq!(
         "t:201ms dn:X t:1ms up:X t:1ms dn:Y t:1ms up:Y t:4ms dn:Space t:1ms up:Space",
+        result
+    );
+}
+
+#[test]
+fn sim_chordsv2_quick_release() {
+    let result = simulate(
+        "
+(defsrc)
+(defcfg concurrent-tap-hold yes)
+(deflayermap layer1)
+(defchordsv2
+ (k l) rsft 75 all-released ()
+)
+        ",
+        "
+d:k d:l t:10
+d:t t:1
+u:k t:1 u:l t:10
+u:t t:10
+",
+    )
+    .to_ascii();
+    assert_eq!("dn:RShift t:11ms dn:T t:4ms up:RShift t:7ms up:T", result);
+}
+
+#[test]
+fn sim_chordsv1_key_history_updates_once() {
+    let result = simulate(
+        "
+(defsrc)
+(defchords iobspc 50
+  (i o) bspc
+)
+(deflayermap (base)
+  i (chord iobspc i)
+  o (chord iobspc o)
+  t (switch
+    ((key-history bspc 3)) a fallthrough
+    ((key-history bspc 2)) b fallthrough
+    ((key-history bspc 1)) c fallthrough
+  )
+)
+        ",
+        "
+d:i d:o t:10
+u:i u:o t:10
+d:t u:t t:10
+d:t u:t t:10
+",
+    )
+    .to_ascii();
+    // For first press of `t`, only position 1 should be filled.
+    // The key history should unpause, so on pressing `t` again,
+    // position 2 is now where bspc is because C was sent.
+    assert_eq!(
+        "t:1ms dn:BSpace t:10ms up:BSpace t:9ms dn:C t:1ms up:C t:9ms dn:B t:1ms up:B",
+        result
+    );
+}
+
+#[test]
+fn prior_idle_chord_participants() {
+    // Tests a past bug where chordv2->tap-hold singles would not be evaluated correctly for
+    // tap-hold require-prior-idle.
+    let result = simulate(
+        "
+        (defcfg
+          process-unmapped-keys yes
+          concurrent-tap-hold yes
+          tap-hold-require-prior-idle 150
+        )
+        (defsrc)
+        (defchordsv2
+          (j c) M-c 75 first-release ()
+        )
+        (deflayermap (main)
+          j (tap-hold 200 300 j rmet)
+          k (tap-hold 200 300 k rsft)
+        )
+        ",
+        "d:j t:40 d:k t:320 d:spc t:40 u:spc t:40 u:k t:20 u:j t:200",
+    )
+    .to_ascii();
+    assert_eq!(
+        "t:298ms dn:RGui t:40ms dn:RShift t:23ms dn:Space \
+         t:39ms up:Space t:40ms up:RShift t:20ms up:RGui",
         result
     );
 }

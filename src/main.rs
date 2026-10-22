@@ -29,36 +29,17 @@ mod cli {
             std::process::exit(0);
         }
 
-        #[cfg(all(target_os = "linux", not(feature = "gui")))]
+        #[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "gui")))]
         if args.list {
             main_lib::list_devices_linux();
             std::process::exit(0);
         }
 
-        #[cfg(all(
-            target_os = "windows",
-            feature = "interception_driver",
-            not(feature = "gui")
-        ))]
+        #[cfg(all(target_os = "windows", feature = "interception_driver"))]
         if args.list {
             main_lib::list_devices_windows();
             std::process::exit(0);
         }
-
-        let config_string = if args.cfg_stdin {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            Some(buf)
-        } else {
-            None
-        };
-
-        let cfg_paths = if config_string.is_none() {
-            args.cfg.unwrap_or_else(default_cfg)
-        } else {
-            vec![]
-        };
 
         let log_lvl = match (args.debug, args.trace, args.quiet) {
             (_, true, false) => LevelFilter::Trace,
@@ -79,7 +60,7 @@ mod cli {
             log_lvl,
             log_cfg.build(),
             TerminalMode::Mixed,
-            ColorChoice::AlwaysAnsi,
+            ColorChoice::Auto,
         )])
         .expect("logger can init");
 
@@ -88,6 +69,41 @@ mod cli {
         log::info!("using LLHOOK+SendInput for keyboard IO");
         #[cfg(all(feature = "interception_driver", target_os = "windows"))]
         log::info!("using the Interception driver for keyboard IO");
+
+        #[cfg(target_os = "macos")]
+        if args.macos_request_permissions {
+            match oskbd::request_accessibility_permission() {
+                Ok(oskbd::AccessibilityPermissionStatus::Trusted) => {
+                    println!(
+                        "macOS reported this process as trusted, but kanata may still not appear as a separate item when launched from Terminal. Add {} manually if it is not listed.",
+                        macos_current_executable_hint()
+                    );
+                    std::process::exit(0);
+                }
+                Ok(oskbd::AccessibilityPermissionStatus::Requested) => {
+                    println!(
+                        "kanata has requested macOS Accessibility permission. Enable kanata in System Settings -> Privacy & Security -> Accessibility, then restart kanata."
+                    );
+                }
+                Err(e) => eprintln!("failed to request macOS Accessibility permission: {e}"),
+            }
+            std::process::exit(1);
+        }
+
+        let config_string = if args.cfg_stdin {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Some(buf)
+        } else {
+            None
+        };
+
+        let cfg_paths = if config_string.is_none() {
+            args.cfg.unwrap_or_else(default_cfg)
+        } else {
+            vec![]
+        };
 
         if config_string.is_none() {
             if let Some(config_file) = cfg_paths.first() {
@@ -125,7 +141,7 @@ mod cli {
             std::process::exit(status);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(wait) = args.wait_device_ms {
             use std::sync::atomic::Ordering;
             log::info!("Setting device registration wait time to {wait} ms.");
@@ -136,12 +152,21 @@ mod cli {
             cfg_forced::force_log_layer_changes(true);
         }
 
+        // Set emergency exit code from CLI args
+        kanata::EMERGENCY_EXIT_CODE.store(
+            args.emergency_exit_code,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+
+        #[cfg(target_os = "macos")]
+        oskbd::set_release_grab_on_lock(args.release_grab_on_lock);
+
         Ok((
             ValidatedArgs {
                 paths: cfg_paths,
                 #[cfg(feature = "tcp_server")]
                 tcp_server_address: args.tcp_server_address,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 symlink_path: args.symlink_path,
                 nodelay: args.nodelay,
             },
@@ -195,26 +220,46 @@ mod cli {
 
         Kanata::start_processing_loop(kanata_arc.clone(), rx, ntx, args.nodelay);
 
+        // Started after the processing loop so the first controller event has
+        // somewhere to go, and before the keyboard event loop, which does not
+        // return.
+        Kanata::start_gamepad_handling_if_configured(&kanata_arc, tx.clone());
+
         if let (Some(server), Some(nrx)) = (server, nrx) {
             #[allow(clippy::unit_arg)]
             Kanata::start_notification_loop(nrx, server.connections);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         sd_notify::notify(true, &[sd_notify::NotifyState::Ready])?;
 
         Kanata::event_loop(kanata_arc, tx)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_current_executable_hint() -> String {
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "kanata".to_string())
     }
 }
 
 #[cfg(not(feature = "gui"))]
 pub fn main() -> Result<()> {
+    let args = Args::parse();
+    #[cfg(feature = "tcp_server")]
+    if let Some(main_lib::args::Command::Msg(msg_args)) = args.command {
+        return main_lib::msg::run(msg_args);
+    }
+    let no_wait = args.no_wait;
     let ret = cli::main_impl();
     if let Err(ref e) = ret {
         log::error!("{e}\n");
     }
-    eprintln!("\nPress enter to exit");
-    let _ = std::io::stdin().read_line(&mut String::new());
+    if !no_wait {
+        eprintln!("\nPress enter to exit");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
     ret
 }
 

@@ -18,15 +18,99 @@ fn set_virtual_key_reference_lsp_hint(vk_name_expr: &SExpr, s: &ParserState) {
     }
 }
 
+pub(crate) fn parse_fake_keys(exprs: &[&Vec<SExpr>], s: &mut ParserState) -> Result<()> {
+    for expr in exprs {
+        let mut subexprs = check_first_expr(expr.iter(), "deffakekeys")?;
+        // Read k-v pairs from the configuration
+        while let Some(key_name_expr) = subexprs.next() {
+            let key_name = key_name_expr
+                .atom(s.vars())
+                .ok_or_else(|| anyhow_expr!(key_name_expr, "Fake key name must not be a list."))?
+                .to_owned();
+            let action = match subexprs.next() {
+                Some(v) => v,
+                None => bail_expr!(
+                    key_name_expr,
+                    "Fake key name has no action - you should add an action."
+                ),
+            };
+            let action = parse_action(action, s)?;
+            let idx = s.virtual_keys.len();
+            log::trace!("inserting {key_name}->{idx}:{action:?}");
+            if s.virtual_keys
+                .insert(key_name.clone(), (idx, action))
+                .is_some()
+            {
+                bail_expr!(key_name_expr, "Duplicate fake key: {}", key_name);
+            }
+            #[cfg(feature = "lsp")]
+            s.lsp_hints
+                .borrow_mut()
+                .definition_locations
+                .virtual_key
+                .insert(key_name, key_name_expr.span());
+        }
+    }
+    if s.virtual_keys.len() > KEYS_IN_ROW {
+        bail!(
+            "Maximum number of fake keys is {KEYS_IN_ROW}, found {}",
+            s.virtual_keys.len()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_virtual_keys(exprs: &[&Vec<SExpr>], s: &mut ParserState) -> Result<()> {
+    s.pctx.is_within_defvirtualkeys = true;
+    for expr in exprs {
+        let mut subexprs = check_first_expr(expr.iter(), "defvirtualkeys")?;
+        // Read k-v pairs from the configuration
+        while let Some(key_name_expr) = subexprs.next() {
+            let key_name = key_name_expr
+                .atom(s.vars())
+                .ok_or_else(|| anyhow_expr!(key_name_expr, "Virtual key name must not be a list."))?
+                .to_owned();
+            let action = match subexprs.next() {
+                Some(v) => v,
+                None => bail_expr!(
+                    key_name_expr,
+                    "Virtual key name has no action - you must add an action."
+                ),
+            };
+            let action = parse_action(action, s)?;
+            let idx = s.virtual_keys.len();
+            log::trace!("inserting {key_name}->{idx}:{action:?}");
+            if s.virtual_keys
+                .insert(key_name.clone(), (idx, action))
+                .is_some()
+            {
+                bail_expr!(key_name_expr, "Duplicate virtual key: {}", key_name);
+            };
+            #[cfg(feature = "lsp")]
+            s.lsp_hints
+                .borrow_mut()
+                .definition_locations
+                .virtual_key
+                .insert(key_name, key_name_expr.span());
+        }
+    }
+    s.pctx.is_within_defvirtualkeys = false;
+    if s.virtual_keys.len() > KEYS_IN_ROW {
+        bail!(
+            "Maximum number of virtual keys is {KEYS_IN_ROW}, found {}",
+            s.virtual_keys.len()
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_on_press_fake_key_op(
     ac_params: &[SExpr],
     s: &ParserState,
 ) -> Result<&'static KanataAction> {
     let (coord, action) = parse_fake_key_op_coord_action(ac_params, s, ON_PRESS_FAKEKEY)?;
     set_virtual_key_reference_lsp_hint(&ac_params[0], s);
-    Ok(s.a.sref(Action::Custom(
-        s.a.sref(s.a.sref_slice(CustomAction::FakeKey { coord, action })),
-    )))
+    custom(CustomAction::FakeKey { coord, action }, &s.a)
 }
 
 pub(crate) fn parse_on_release_fake_key_op(
@@ -35,9 +119,7 @@ pub(crate) fn parse_on_release_fake_key_op(
 ) -> Result<&'static KanataAction> {
     let (coord, action) = parse_fake_key_op_coord_action(ac_params, s, ON_RELEASE_FAKEKEY)?;
     set_virtual_key_reference_lsp_hint(&ac_params[0], s);
-    Ok(s.a.sref(Action::Custom(s.a.sref(
-        s.a.sref_slice(CustomAction::FakeKeyOnRelease { coord, action }),
-    ))))
+    custom(CustomAction::FakeKeyOnRelease { coord, action }, &s.a)
 }
 
 pub(crate) fn parse_on_idle_fakekey(
@@ -84,13 +166,14 @@ pub(crate) fn parse_on_idle_fakekey(
     let (x, y) = get_fake_key_coords(y);
     let coord = Coord { x, y };
     set_virtual_key_reference_lsp_hint(&ac_params[0], s);
-    Ok(s.a.sref(Action::Custom(s.a.sref(s.a.sref_slice(
+    custom(
         CustomAction::FakeKeyOnIdle(FakeKeyOnIdle {
             coord,
             action,
             idle_duration,
         }),
-    )))))
+        &s.a,
+    )
 }
 
 fn parse_fake_key_op_coord_action(
@@ -170,11 +253,13 @@ fn parse_delay(
         .map(str::parse::<u16>)
         .ok_or_else(|| anyhow!("{ERR_MSG}"))?
         .map_err(|e| anyhow!("{ERR_MSG}: {e}"))?;
-    Ok(s.a
-        .sref(Action::Custom(s.a.sref(s.a.sref_slice(match is_release {
+    custom(
+        match is_release {
             false => CustomAction::Delay(delay),
             true => CustomAction::DelayOnRelease(delay),
-        })))))
+        },
+        &s.a,
+    )
 }
 
 pub(crate) fn parse_vkey_coord(param: &SExpr, s: &ParserState) -> Result<Coord> {
@@ -223,9 +308,7 @@ pub(crate) fn parse_on_press(
     let action = parse_vkey_action(&ac_params[0], s)?;
     let coord = parse_vkey_coord(&ac_params[1], s)?;
 
-    Ok(s.a.sref(Action::Custom(
-        s.a.sref(s.a.sref_slice(CustomAction::FakeKey { coord, action })),
-    )))
+    custom(CustomAction::FakeKey { coord, action }, &s.a)
 }
 
 pub(crate) fn parse_on_release(
@@ -239,9 +322,7 @@ pub(crate) fn parse_on_release(
     let action = parse_vkey_action(&ac_params[0], s)?;
     let coord = parse_vkey_coord(&ac_params[1], s)?;
 
-    Ok(s.a.sref(Action::Custom(s.a.sref(
-        s.a.sref_slice(CustomAction::FakeKeyOnRelease { coord, action }),
-    ))))
+    custom(CustomAction::FakeKeyOnRelease { coord, action }, &s.a)
 }
 
 pub(crate) fn parse_on_idle(ac_params: &[SExpr], s: &ParserState) -> Result<&'static KanataAction> {
@@ -253,13 +334,14 @@ pub(crate) fn parse_on_idle(ac_params: &[SExpr], s: &ParserState) -> Result<&'st
     let action = parse_vkey_action(&ac_params[1], s)?;
     let coord = parse_vkey_coord(&ac_params[2], s)?;
 
-    Ok(s.a.sref(Action::Custom(s.a.sref(s.a.sref_slice(
+    custom(
         CustomAction::FakeKeyOnIdle(FakeKeyOnIdle {
             coord,
             action,
             idle_duration,
         }),
-    )))))
+        &s.a,
+    )
 }
 
 pub(crate) fn parse_on_physical_idle(
@@ -275,13 +357,14 @@ pub(crate) fn parse_on_physical_idle(
     let action = parse_vkey_action(&ac_params[1], s)?;
     let coord = parse_vkey_coord(&ac_params[2], s)?;
 
-    Ok(s.a.sref(Action::Custom(s.a.sref(s.a.sref_slice(
+    custom(
         CustomAction::FakeKeyOnPhysicalIdle(FakeKeyOnIdle {
             coord,
             action,
             idle_duration,
         }),
-    )))))
+        &s.a,
+    )
 }
 
 pub(crate) fn parse_hold_for_duration(
@@ -295,10 +378,11 @@ pub(crate) fn parse_hold_for_duration(
     let hold_duration = parse_non_zero_u16(&ac_params[0], s, "hold-duration")?;
     let coord = parse_vkey_coord(&ac_params[1], s)?;
 
-    Ok(s.a.sref(Action::Custom(s.a.sref(s.a.sref_slice(
+    custom(
         CustomAction::FakeKeyHoldForDuration(FakeKeyHoldForDuration {
             coord,
             hold_duration,
         }),
-    )))))
+        &s.a,
+    )
 }

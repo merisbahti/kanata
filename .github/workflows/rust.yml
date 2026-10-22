@@ -9,6 +9,8 @@ on:
       - keyberon/**/*
       - cfg_samples/**/*
       - parser/**/*
+      - tcp_protocol/**/*
+      - wasm/**/*
       - .github/workflows/rust.yml
   pull_request:
     branches: [ "main" ]
@@ -18,6 +20,8 @@ on:
       - keyberon/**/*
       - parser/**/*
       - cfg_samples/**/*
+      - tcp_protocol/**/*
+      - wasm/**/*
       - .github/workflows/rust.yml
 
 env:
@@ -29,9 +33,29 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     - name: Check fmt
       run: cargo fmt --all --check
+
+  build-android:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - build: linux
+            os: ubuntu-latest
+            target: aarch64-linux-android
+
+    steps:
+    - uses: actions/checkout@v6
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "persist-cross-job"
+        workspaces: ./
+    - run: rustup target add aarch64-linux-android
+
+    - name: Build for Android
+      run: cargo check --target aarch64-linux-android
 
   build-test-clippy-linux:
     runs-on: ${{ matrix.os }}
@@ -43,12 +67,14 @@ jobs:
             target: x86_64-unknown-linux-musl
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "persist-cross-job"
         workspaces: ./
     - run: rustup component add clippy
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
 
     - name: Run tests no features
       run: cargo test --all --no-default-features
@@ -85,7 +111,7 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "persist-cross-job"
@@ -108,7 +134,7 @@ jobs:
       run: cargo clippy --all --features=cmd,win_llhook_read_scancodes,win_sendinput_send_scancodes -- -D warnings
 
     - name: Run tests all features
-      run: cargo test --all --features=cmd,interception_driver,win_sendinput_send_scancodes
+      run: cargo test  -p kanata -p kanata-parser -p kanata-keyberon -p kanata-tcp-protocol --features=cmd,interception_driver,win_sendinput_send_scancodes
     - name: Run clippy all features
       run: cargo clippy --all --features=cmd,interception_driver,win_sendinput_send_scancodes -- -D warnings
 
@@ -137,7 +163,7 @@ jobs:
             target: x86_64-apple-darwin
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "persist-cross-job"

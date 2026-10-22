@@ -29,11 +29,11 @@ pub struct KbdOut {
 
 use std::io::{Error as IoErr, ErrorKind::NotConnected};
 impl KbdOut {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub fn new() -> Result<Self, io::Error> {
         Ok(Self { tx_kout: None })
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn new(
         _s: &Option<String>,
         _tp: bool,
@@ -42,7 +42,7 @@ impl KbdOut {
     ) -> Result<Self, io::Error> {
         Ok(Self { tx_kout: None })
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn write_raw(&mut self, event: InputEvent) -> Result<(), io::Error> {
         trace!("out-raw:{event:?}");
         Ok(())
@@ -74,6 +74,12 @@ impl KbdOut {
         }
         Ok(())
     }
+    pub fn output_ready(&self) -> bool {
+        true
+    }
+    pub fn wait_until_ready(&self, _timeout: Option<std::time::Duration>) -> bool {
+        true
+    }
     pub fn write_key(&mut self, key: OsCode, value: KeyValue) -> Result<(), io::Error> {
         let key_ev = KeyEvent::new(key, value);
         let event = {
@@ -98,6 +104,7 @@ impl KbdOut {
     pub fn release_key(&mut self, key: OsCode) -> Result<(), io::Error> {
         self.write_key(key, KeyValue::Release)
     }
+    pub fn release_tracked_output_keys(&mut self, _reason: &str) {}
     pub fn send_unicode(&mut self, c: char) -> Result<(), io::Error> {
         trace!("outU:{c}");
         Ok(())
@@ -165,13 +172,13 @@ impl InputEvent {
 impl TryFrom<InputEvent> for KeyEvent {
     type Error = ();
     fn try_from(item: InputEvent) -> Result<Self, Self::Error> {
-        Ok(Self {
-            code: OsCode::from_u16(item.code as u16).ok_or(())?,
-            value: match item.up {
+        Ok(Self::new(
+            OsCode::from_u16(item.code as u16).ok_or(())?,
+            match item.up {
                 true => KeyValue::Release,
                 false => KeyValue::Press,
             },
-        })
+        ))
     }
 }
 

@@ -1,7 +1,7 @@
 //! The different actions that can be executed via any given key.
 
 use crate::key_code::KeyCode;
-use crate::layout::{QueuedIter, WaitingAction};
+use crate::layout::{KCoord, QueuedIter, WaitingAction};
 use core::fmt::Debug;
 
 pub mod switch;
@@ -61,6 +61,13 @@ pub enum HoldTapConfig<'a> {
     /// not used in the flow of typing, like escape for example. If
     /// you are annoyed by accidental tap, you can try this behavior.
     HoldOnOtherKeyPress,
+    /// Resolves based on release order after both keys are down.
+    /// If the other key releases first (modifier still held) → Hold.
+    /// If the modifier releases first (other key still held) → Tap.
+    /// The buffer field specifies a grace period in ticks (ms) after the
+    /// initial press during which release-order logic is ignored and fast
+    /// typing will resolve as Tap.
+    Order { buffer: u16 },
     /// If there is a press and release of another key, the hold
     /// action is activated.
     ///
@@ -72,10 +79,14 @@ pub enum HoldTapConfig<'a> {
     /// A custom configuration. Allows the behavior to be controlled by a caller
     /// supplied handler function.
     ///
-    /// The input to the custom handler will be an iterator that returns
+    /// The first argument to the custom handler will be an iterator that returns
     /// [Stacked] [Events](Event). The order of the events matches the order the
     /// corresponding key was pressed/released, i.e. the first event is the
     /// event first received after the HoldTap action key is pressed.
+    ///
+    /// The second argument is the coordinate `(row, col)` of the key that
+    /// initiated the HoldTap action, allowing the handler to identify which
+    /// physical key is waiting for resolution.
     ///
     /// The return value should be the intended action that should be used. A
     /// [Some] value will cause one of: [WaitingAction::Tap] for the configured
@@ -87,7 +98,8 @@ pub enum HoldTapConfig<'a> {
     /// The bool value defines if the timeout check should be skipped at the
     /// next tick. This should generally be false. This is used by `tap-hold-
     /// except-keys` to handle presses even when the timeout has been reached.
-    Custom(&'a (dyn Fn(QueuedIter) -> (Option<WaitingAction>, bool) + Send + Sync)),
+    #[allow(clippy::type_complexity)]
+    Custom(&'a (dyn Fn(QueuedIter, KCoord) -> (Option<WaitingAction>, bool) + Send + Sync)),
 }
 
 impl Debug for HoldTapConfig<'_> {
@@ -95,6 +107,7 @@ impl Debug for HoldTapConfig<'_> {
         match self {
             HoldTapConfig::Default => f.write_str("Default"),
             HoldTapConfig::HoldOnOtherKeyPress => f.write_str("HoldOnOtherKeyPress"),
+            HoldTapConfig::Order { .. } => f.write_str("Order"),
             HoldTapConfig::PermissiveHold => f.write_str("PermissiveHold"),
             HoldTapConfig::Custom(_) => f.write_str("Custom"),
         }
@@ -108,6 +121,7 @@ impl PartialEq for HoldTapConfig<'_> {
             (HoldTapConfig::Default, HoldTapConfig::Default)
             | (HoldTapConfig::HoldOnOtherKeyPress, HoldTapConfig::HoldOnOtherKeyPress)
             | (HoldTapConfig::PermissiveHold, HoldTapConfig::PermissiveHold) => true,
+            (HoldTapConfig::Order { .. }, HoldTapConfig::Order { .. }) => true,
             _ => false,
         }
     }
@@ -172,6 +186,10 @@ where
     /// because a human might have a slow release but they did
     /// indeed want a hold to activate.
     pub on_press_reset_timeout_to: Option<std::num::NonZeroU16>,
+    /// Per-action override for the global `tap_hold_require_prior_idle` setting.
+    /// If `Some(n)`, uses `n` instead of the global value (0 = disabled for this action).
+    /// If `None`, falls back to the global `defcfg` value.
+    pub require_prior_idle: Option<u16>,
 }
 
 /// Define one shot key behaviour.

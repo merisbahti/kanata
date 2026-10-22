@@ -1,6 +1,6 @@
 [package]
 name = "kanata-keyberon"
-version = "0.190.0"
+version = "1.1130.0"
 authors = ["Guillaume Pinot <texitoi@texitoi.eu>", "Robin Krahl <robin.krahl@ireas.org>", "jtroo <j.andreitabs@gmail.com>"]
 edition = "2021"
 description = "Pure Rust keyboard firmware. Fork intended for use with kanata."
@@ -10,6 +10,9 @@ keywords = ["keyboard", "kanata"]
 categories = ["no-std"]
 license = "MIT"
 readme = "README.md"
+
+[features]
+tap_hold_tracker = []
 
 [dependencies]
 kanata-keyberon-macros = { version = "0.2.0" }

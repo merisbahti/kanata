@@ -1,0 +1,15 @@
+name: build-everything
+
+on: workflow_dispatch
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  build-linux:
+    uses: ./.github/workflows/linux-build.yml
+  build-windows:
+    uses: ./.github/workflows/windows-build.yml
+  build-macos:
+    uses: ./.github/workflows/macos-build.yml

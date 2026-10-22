@@ -199,7 +199,15 @@ impl TryFrom<OsCode> for PageCode {
                 page: 0x07,
                 code: 0x31,
             }),
-            // KeyboardNonUSPound                => 0x0732, todo
+            // Keyboard Non-US # and ~ (ISO layouts, key left of Enter labelled "#").
+            // Linux evdev folds this onto KEY_BACKSLASH (43); macOS exposes it as a
+            // distinct HID usage, so we reuse the otherwise-unused KEY_NUMERIC_POUND
+            // OsCode. Users who want a symmetric name across platforms can pair this
+            // with `deflocalkeys-linux` mapping 43 to the same name. See #1915.
+            OsCode::KEY_NUMERIC_POUND => Ok(PageCode {
+                page: 0x07,
+                code: 0x32,
+            }),
             OsCode::KEY_SEMICOLON => Ok(PageCode {
                 page: 0x07,
                 code: 0x33,
@@ -400,7 +408,10 @@ impl TryFrom<OsCode> for PageCode {
                 page: 0x07,
                 code: 0x64,
             }), //KeyboardNonUSBackslash
-            // KeyboardApplication               => 0x0765, todo
+            OsCode::KEY_COMPOSE => Ok(PageCode {
+                page: 0x07,
+                code: 0x65,
+            }),
             OsCode::KEY_POWER => Ok(PageCode {
                 page: 0x07,
                 code: 0x66,
@@ -521,6 +532,30 @@ impl TryFrom<OsCode> for PageCode {
                 page: 0x07,
                 code: 0x85,
             }),
+            OsCode::KEY_RO => Ok(PageCode {
+                page: 0x07,
+                code: 0x87,
+            }),
+            OsCode::KEY_KATAKANAHIRAGANA => Ok(PageCode {
+                page: 0x07,
+                code: 0x88,
+            }),
+            OsCode::KEY_YEN => Ok(PageCode {
+                page: 0x07,
+                code: 0x89,
+            }),
+            OsCode::KEY_HENKAN => Ok(PageCode {
+                page: 0x07,
+                code: 0x8A,
+            }),
+            OsCode::KEY_MUHENKAN => Ok(PageCode {
+                page: 0x07,
+                code: 0x8B,
+            }),
+            OsCode::KEY_KPJPCOMMA => Ok(PageCode {
+                page: 0x07,
+                code: 0x8C,
+            }),
             OsCode::KEY_HANGEUL => Ok(PageCode {
                 page: 0x07,
                 code: 0x90,
@@ -528,6 +563,18 @@ impl TryFrom<OsCode> for PageCode {
             OsCode::KEY_HANJA => Ok(PageCode {
                 page: 0x07,
                 code: 0x91,
+            }),
+            OsCode::KEY_KATAKANA => Ok(PageCode {
+                page: 0x07,
+                code: 0x92,
+            }),
+            OsCode::KEY_HIRAGANA => Ok(PageCode {
+                page: 0x07,
+                code: 0x93,
+            }),
+            OsCode::KEY_ZENKAKUHANKAKU => Ok(PageCode {
+                page: 0x07,
+                code: 0x94,
             }),
             OsCode::KEY_ALTERASE => Ok(PageCode {
                 page: 0x07,
@@ -875,6 +922,11 @@ impl TryFrom<PageCode> for OsCode {
                 page: 0x07,
                 code: 0x31,
             } => Ok(OsCode::KEY_BACKSLASH),
+            // Keyboard Non-US # and ~. See the forward mapping above for rationale.
+            PageCode {
+                page: 0x07,
+                code: 0x32,
+            } => Ok(OsCode::KEY_NUMERIC_POUND),
             PageCode {
                 page: 0x07,
                 code: 0x33,
@@ -1077,6 +1129,10 @@ impl TryFrom<PageCode> for OsCode {
             } => Ok(OsCode::KEY_102ND),
             PageCode {
                 page: 0x07,
+                code: 0x65,
+            } => Ok(OsCode::KEY_COMPOSE),
+            PageCode {
+                page: 0x07,
                 code: 0x66,
             } => Ok(OsCode::KEY_POWER),
             PageCode {
@@ -1193,12 +1249,48 @@ impl TryFrom<PageCode> for OsCode {
             } => Ok(OsCode::KEY_KPCOMMA),
             PageCode {
                 page: 0x07,
+                code: 0x87,
+            } => Ok(OsCode::KEY_RO),
+            PageCode {
+                page: 0x07,
+                code: 0x88,
+            } => Ok(OsCode::KEY_KATAKANAHIRAGANA),
+            PageCode {
+                page: 0x07,
+                code: 0x89,
+            } => Ok(OsCode::KEY_YEN),
+            PageCode {
+                page: 0x07,
+                code: 0x8A,
+            } => Ok(OsCode::KEY_HENKAN),
+            PageCode {
+                page: 0x07,
+                code: 0x8B,
+            } => Ok(OsCode::KEY_MUHENKAN),
+            PageCode {
+                page: 0x07,
+                code: 0x8C,
+            } => Ok(OsCode::KEY_KPJPCOMMA),
+            PageCode {
+                page: 0x07,
                 code: 0x90,
             } => Ok(OsCode::KEY_HANGEUL),
             PageCode {
                 page: 0x07,
                 code: 0x91,
             } => Ok(OsCode::KEY_HANJA),
+            PageCode {
+                page: 0x07,
+                code: 0x92,
+            } => Ok(OsCode::KEY_KATAKANA),
+            PageCode {
+                page: 0x07,
+                code: 0x93,
+            } => Ok(OsCode::KEY_HIRAGANA),
+            PageCode {
+                page: 0x07,
+                code: 0x94,
+            } => Ok(OsCode::KEY_ZENKAKUHANKAKU),
             PageCode {
                 page: 0x07,
                 code: 0x99,

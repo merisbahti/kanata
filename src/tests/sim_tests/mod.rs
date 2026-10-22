@@ -4,28 +4,145 @@
 //! the test fail by comparing the output to an empty string. Run the test then inspect the failure
 //! and see if the real output looks sensible according to what is expected.
 
+use std::num::NonZeroU128;
+
 use crate::tests::*;
 use crate::{
-    Kanata,
+    FAKE_KEY_ROW, FakeKeyAction, Kanata,
+    kanata::handle_fakekey_action,
     oskbd::{KeyEvent, KeyValue},
     str_to_oscode,
 };
 
 use rustc_hash::FxHashMap;
 
+/// Parse a fakekey specification like "name" or "name:action"
+/// Returns (name, action) where action defaults to Press if not specified.
+fn parse_fakekey_spec(spec: &str) -> (&str, FakeKeyAction) {
+    match spec.split_once(':') {
+        Some((name, action_str)) => {
+            let action = match action_str {
+                "press" | "p" => FakeKeyAction::Press,
+                "release" => FakeKeyAction::Release,
+                "tap" | "t" => FakeKeyAction::Tap,
+                "toggle" | "g" => FakeKeyAction::Toggle,
+                _ => panic!(
+                    "unknown fakekey action: {action_str}. Expected: press, release, tap, or toggle"
+                ),
+            };
+            (name, action)
+        }
+        None => (spec, FakeKeyAction::Press),
+    }
+}
+
+/// Apply a fakekey action to the kanata instance
+fn apply_fakekey_action(k: &mut Kanata, name: &str, action: FakeKeyAction) {
+    let index = k
+        .virtual_keys
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown virtual key: {name}"));
+    handle_fakekey_action(action, k.layout.bm(), FAKE_KEY_ROW, *index as u16);
+}
+
+/// The controller the `pad:` verb speaks for.
+///
+/// One is enough: merging several is the engine's own concern and is covered
+/// there, without needing a processing loop.
+const SIM_PAD: crate::gamepad::PadDeviceId = crate::gamepad::PadDeviceId::new(0);
+
+/// Move an analog control, as the controller backend would.
+///
+/// `spec` is `<control>:<value>`, where a stick takes `<x>,<y>` in
+/// `-1.0..=1.0` (y-up) and a trigger takes a single `0.0..=1.0`:
+///
+/// ```text
+/// pad:left:0.5,-0.25   pad:right:0,1   pad:lt:0.8
+/// ```
+///
+/// This stands in for the backend thread, which needs hardware; everything
+/// downstream of it — projection, the `defsrc` gate, the layout, the tick
+/// loop's motion sampling — is exactly what runs in production. Digital
+/// controls need none of this: they are ordinary `OsCode`s, so `d:pad-a`
+/// already works.
+fn apply_pad_analog(k: &mut Kanata, spec: &str) {
+    use kanata_parser::gamepad::{PadInput, Side, StickPosition, Unit};
+
+    let (control, value) = spec
+        .split_once(':')
+        .unwrap_or_else(|| panic!("pad spec must be <control>:<value>, got: {spec}"));
+    let number = |text: &str| {
+        text.parse::<f32>()
+            .unwrap_or_else(|_| panic!("expected a number in the pad spec, got: {text}"))
+    };
+    let input = match control {
+        "left" | "right" => {
+            let side = match control {
+                "left" => Side::Left,
+                _ => Side::Right,
+            };
+            let (x, y) = value
+                .split_once(',')
+                .unwrap_or_else(|| panic!("a stick takes <x>,<y>, got: {value}"));
+            PadInput::Stick {
+                side,
+                value: StickPosition::new(number(x), number(y)),
+            }
+        }
+        "lt" | "rt" => PadInput::Trigger {
+            side: match control {
+                "lt" => Side::Left,
+                _ => Side::Right,
+            },
+            value: Unit::new(number(value)),
+        },
+        other => panic!("unknown analog control: {other}\nvalid: left, right, lt, rt"),
+    };
+
+    // Created on first use: `Kanata::start_gamepad_handling_if_configured` is a
+    // startup step the sim does not run, since it would spawn a thread looking
+    // for real hardware.
+    let gamepad = k.gamepad.get_or_insert_with(|| {
+        let config = k
+            .gamepad_config
+            .expect("the config must declare defgamepad to drive an analog control");
+        let handle = crate::gamepad::GamepadHandle::new(config, k.input_devices.as_deref());
+        handle.connect(SIM_PAD, Default::default());
+        handle
+    });
+    let mut edges = Vec::new();
+    gamepad.feed(SIM_PAD, input, &mut edges);
+    k.apply_gamepad_edges(&edges)
+        .expect("controller edges apply fine");
+}
+
+/// Apply a layer switch to the kanata instance
+fn apply_layer_switch(k: &mut Kanata, layer_name: &str) {
+    let layer_idx = k
+        .layer_info
+        .iter()
+        .position(|l| l.name == layer_name)
+        .unwrap_or_else(|| panic!("unknown layer: {layer_name}"));
+    k.layout.bm().set_default_layer(layer_idx);
+}
+
 mod block_keys_tests;
 mod capsword_sim_tests;
 mod chord_sim_tests;
 mod delay_tests;
+mod gamepad_sim_tests;
 mod layer_sim_tests;
 mod macro_sim_tests;
+mod mouse_sim_tests;
 mod oneshot_tests;
 mod output_chord_tests;
 mod override_tests;
 mod release_sim_tests;
 mod repeat_sim_tests;
 mod seq_sim_tests;
+mod suppress_keys_tests;
 mod switch_sim_tests;
+mod tap_dance_tests;
 mod tap_hold_tests;
 mod template_sim_tests;
 mod timing_tests;
@@ -55,36 +172,56 @@ fn simulate_with_file_content<S: AsRef<str>>(
         match pair.split_once(':') {
             Some((kind, val)) => match kind {
                 "t" => {
-                    let tick = str::parse::<u128>(val).expect("valid num for tick");
-                    k.tick_ms(tick, &None).unwrap();
-                    k.can_block_update_idle_waiting(tick as u16);
+                    let ticks = str::parse::<u128>(val).expect("valid num for tick");
+                    let mut ticks_with_no_processing: Option<NonZeroU128> = None;
+                    for t in 0..ticks {
+                        let _ = k.tick_ms(1, &None);
+                        let can_block = k.can_block_update_idle_waiting(1);
+                        if can_block {
+                            ticks_with_no_processing = NonZeroU128::new(ticks - t);
+                            break;
+                        }
+                    }
+                    if let Some(twnp) = ticks_with_no_processing {
+                        for _ in 1..twnp.into() {
+                            k.kbd_out.tick();
+                        }
+                    }
                 }
                 "d" => {
                     let key_code = str_to_oscode(val).expect("valid keycode");
-                    k.handle_input_event(&KeyEvent {
-                        code: key_code,
-                        value: KeyValue::Press,
-                    })
-                    .expect("input handles fine");
+                    k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Press))
+                        .expect("input handles fine");
+                    #[cfg(not(all(target_os = "windows", not(feature = "interception_driver"))))]
                     crate::PRESSED_KEYS.lock().insert(key_code);
+                    #[cfg(all(target_os = "windows", not(feature = "interception_driver")))]
+                    crate::PRESSED_KEYS
+                        .lock()
+                        .insert(key_code, web_time::Instant::now());
                 }
                 "u" => {
                     let key_code = str_to_oscode(val).expect("valid keycode");
-                    k.handle_input_event(&KeyEvent {
-                        code: key_code,
-                        value: KeyValue::Release,
-                    })
-                    .expect("input handles fine");
+                    k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Release))
+                        .expect("input handles fine");
                     crate::PRESSED_KEYS.lock().remove(&key_code);
                 }
                 "r" => {
                     let key_code = str_to_oscode(val).expect("valid keycode");
-                    k.handle_input_event(&KeyEvent {
-                        code: key_code,
-                        value: KeyValue::Repeat,
-                    })
-                    .expect("input handles fine");
+                    k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Repeat))
+                        .expect("input handles fine");
                 }
+                // Virtual/fake key activation: vk:name[:action] or fakekey:name[:action]
+                // Supported actions: press (p), release, tap (t), toggle (g)
+                "vk" | "fakekey" | "virtualkey" | "🎭" => {
+                    let (vk_name, action) = parse_fakekey_spec(val);
+                    apply_fakekey_action(&mut k, vk_name, action);
+                }
+                // Layer switch: ls:layer_name
+                "ls" | "layer-switch" | "🔀" => {
+                    apply_layer_switch(&mut k, val);
+                }
+                // Controller analog control: pad:left:0.5,-0.25 or pad:lt:0.8
+                "pad" => apply_pad_analog(&mut k, val),
                 _ => panic!("invalid item {pair}"),
             },
             None => panic!("invalid item {pair}"),

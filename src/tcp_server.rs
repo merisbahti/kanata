@@ -51,6 +51,68 @@ fn to_action(val: FakeKeyActionMessage) -> FakeKeyAction {
     }
 }
 
+/// Handles reload commands with optional wait/timeout for completion confirmation.
+/// Returns false if the connection should be closed, true otherwise.
+#[cfg(feature = "tcp_server")]
+#[allow(clippy::too_many_arguments)]
+fn handle_reload_with_wait(
+    reload_cmd: ClientMessage,
+    wait: Option<bool>,
+    timeout_ms: Option<u64>,
+    stream: &mut TcpStream,
+    kanata: &Arc<Mutex<Kanata>>,
+    connections: &Connections,
+    addr: &str,
+    wakeup_channel: &Sender<KeyEvent>,
+) -> bool {
+    let (response, reload_ok) = match kanata.lock().handle_client_command(reload_cmd) {
+        Ok(_) => (ServerResponse::Ok, true),
+        Err(e) => (
+            ServerResponse::Error {
+                msg: format!("{e}"),
+            },
+            false,
+        ),
+    };
+    if !send_response(stream, response, connections, addr) {
+        return false;
+    }
+
+    // If wait flag is set and reload succeeded, poll for completion
+    if reload_ok && wait.unwrap_or(false) {
+        // The processing loop may be blocked waiting for input and only does
+        // the reload once woken up, so wake it now instead of after the wait.
+        use kanata_parser::keys::*;
+        wakeup_channel
+            .send(KeyEvent::new(OsCode::KEY_RESERVED, KeyValue::WakeUp))
+            .expect("write key event");
+        let timeout_ms = timeout_ms.unwrap_or(5000);
+        let start = std::time::Instant::now();
+        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+
+        while start.elapsed() < timeout_duration {
+            if kanata.lock().is_reload_complete() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let timed_out = start.elapsed() >= timeout_duration;
+
+        let ok = kanata.lock().last_reload_succeeded();
+        let msg = ServerMessage::ReloadResult {
+            ok,
+            timeout_ms: if timed_out { Some(timeout_ms) } else { None },
+        };
+        if let Err(err) = stream.write_all(&msg.as_bytes()) {
+            log::error!("Error writing ReloadResult: {err}");
+            connections.lock().remove(addr);
+            return false;
+        }
+        let _ = stream.flush();
+    }
+    true
+}
+
 #[cfg(feature = "tcp_server")]
 pub struct TcpServer {
     pub address: SocketAddr,
@@ -109,10 +171,13 @@ impl TcpServer {
                             }
                         }
 
-                        let addr = stream
-                            .peer_addr()
-                            .expect("incoming conn has known address")
-                            .to_string();
+                        let addr = match stream.peer_addr() {
+                            Ok(addr) => addr.to_string(),
+                            Err(e) => {
+                                log::warn!("failed to get peer address, using fallback: {e:?}");
+                                format!("unknown_{}", std::ptr::addr_of!(stream) as usize)
+                            }
+                        };
 
                         connections.lock().insert(
                             addr.clone(),
@@ -153,6 +218,22 @@ impl TcpServer {
                                                     ),
                                                 }
                                             }
+                                            ClientMessage::RequestFakeKeyNames {} => {
+                                                let msg = ServerMessage::FakeKeyNames {
+                                                    names: kanata
+                                                        .lock()
+                                                        .virtual_keys
+                                                        .keys()
+                                                        .cloned()
+                                                        .collect::<Vec<_>>(),
+                                                };
+                                                match stream.write_all(&msg.as_bytes()) {
+                                                    Ok(_) => {}
+                                                    Err(err) => log::error!(
+                                                        "server could not send response: {err}"
+                                                    ),
+                                                }
+                                            }
                                             ClientMessage::ActOnFakeKey { name, action } => {
                                                 let mut k = kanata.lock();
                                                 let index = match k.virtual_keys.get(&name) {
@@ -161,8 +242,8 @@ impl TcpServer {
                                                         if let Err(e) = stream.write_all(
                                                             &ServerMessage::Error {
                                                                 msg: format!(
-                                                                "unknown virtual/fake key: {name}"
-                                                            ),
+                                                                    "unknown virtual/fake key: {name}"
+                                                                ),
                                                             }
                                                             .as_bytes(),
                                                         ) {
@@ -195,17 +276,12 @@ impl TcpServer {
                                                         log::info!(
                                                             "sucessfully did set mouse position to: x {x} y {y}"
                                                         );
-                                                        // Optionally send a success message to the
-                                                        // client
                                                     }
                                                     Err(e) => {
                                                         log::error!(
                                                             "Failed to set mouse position: {}",
                                                             e
                                                         );
-                                                        // Implement any error handling logic here,
-                                                        // such as sending an error response to
-                                                        // the client
                                                     }
                                                 }
                                             }
@@ -240,50 +316,131 @@ impl TcpServer {
                                                     ),
                                                 }
                                             }
-                                            // Handle reload commands with unified response protocol
-                                            reload_cmd @ (ClientMessage::Reload {}
-                                            | ClientMessage::ReloadNext {}
-                                            | ClientMessage::ReloadPrev {}
-                                            | ClientMessage::ReloadNum { .. }
-                                            | ClientMessage::ReloadFile { .. }) => {
-                                                // Log specific action type
-                                                match &reload_cmd {
-                                                    ClientMessage::Reload {} => {
-                                                        log::info!("tcp server Reload action")
-                                                    }
-                                                    ClientMessage::ReloadNext {} => {
-                                                        log::info!("tcp server ReloadNext action")
-                                                    }
-                                                    ClientMessage::ReloadPrev {} => {
-                                                        log::info!("tcp server ReloadPrev action")
-                                                    }
-                                                    ClientMessage::ReloadNum { index } => {
-                                                        log::info!(
-                                                            "tcp server ReloadNum action: index {index}"
-                                                        )
-                                                    }
-                                                    ClientMessage::ReloadFile { path } => {
-                                                        log::info!(
-                                                            "tcp server ReloadFile action: path {path}"
-                                                        )
-                                                    }
-                                                    _ => unreachable!(),
-                                                }
-
-                                                let response = match kanata
-                                                    .lock()
-                                                    .handle_client_command(reload_cmd)
-                                                {
-                                                    Ok(_) => ServerResponse::Ok,
-                                                    Err(e) => ServerResponse::Error {
-                                                        msg: format!("{e}"),
-                                                    },
+                                            // New command: Hello - capability detection
+                                            ClientMessage::Hello {} => {
+                                                let version = env!("CARGO_PKG_VERSION").to_string();
+                                                let capabilities = vec![
+                                                    "reload".to_string(),
+                                                    "layer-names".to_string(),
+                                                    "fake-key-names".to_string(),
+                                                    "layer-change".to_string(),
+                                                    "hold-activated".to_string(),
+                                                    "tap-activated".to_string(),
+                                                    "current-layer-name".to_string(),
+                                                    "current-layer-info".to_string(),
+                                                    "fake-key".to_string(),
+                                                    "set-mouse".to_string(),
+                                                ];
+                                                let msg = ServerMessage::HelloOk {
+                                                    version,
+                                                    protocol: 1,
+                                                    capabilities,
                                                 };
-                                                if !send_response(
+                                                match stream.write_all(&msg.as_bytes()) {
+                                                    Ok(_) => {
+                                                        let _ = stream.flush();
+                                                    }
+                                                    Err(err) => {
+                                                        log::error!(
+                                                            "Error writing HelloOk response: {err}"
+                                                        );
+                                                        connections.lock().remove(&addr);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            // Reload commands with optional wait/timeout
+                                            ClientMessage::Reload { wait, timeout_ms } => {
+                                                log::info!("tcp server Reload action");
+                                                if !handle_reload_with_wait(
+                                                    ClientMessage::Reload { wait, timeout_ms },
+                                                    wait,
+                                                    timeout_ms,
                                                     &mut stream,
-                                                    response,
+                                                    &kanata,
                                                     &connections,
                                                     &addr,
+                                                    &wakeup_channel,
+                                                ) {
+                                                    break;
+                                                }
+                                            }
+                                            ClientMessage::ReloadNext { wait, timeout_ms } => {
+                                                log::info!("tcp server ReloadNext action");
+                                                if !handle_reload_with_wait(
+                                                    ClientMessage::ReloadNext { wait, timeout_ms },
+                                                    wait,
+                                                    timeout_ms,
+                                                    &mut stream,
+                                                    &kanata,
+                                                    &connections,
+                                                    &addr,
+                                                    &wakeup_channel,
+                                                ) {
+                                                    break;
+                                                }
+                                            }
+                                            ClientMessage::ReloadPrev { wait, timeout_ms } => {
+                                                log::info!("tcp server ReloadPrev action");
+                                                if !handle_reload_with_wait(
+                                                    ClientMessage::ReloadPrev { wait, timeout_ms },
+                                                    wait,
+                                                    timeout_ms,
+                                                    &mut stream,
+                                                    &kanata,
+                                                    &connections,
+                                                    &addr,
+                                                    &wakeup_channel,
+                                                ) {
+                                                    break;
+                                                }
+                                            }
+                                            ClientMessage::ReloadNum {
+                                                index,
+                                                wait,
+                                                timeout_ms,
+                                            } => {
+                                                log::info!(
+                                                    "tcp server ReloadNum action: index {index}"
+                                                );
+                                                if !handle_reload_with_wait(
+                                                    ClientMessage::ReloadNum {
+                                                        index,
+                                                        wait,
+                                                        timeout_ms,
+                                                    },
+                                                    wait,
+                                                    timeout_ms,
+                                                    &mut stream,
+                                                    &kanata,
+                                                    &connections,
+                                                    &addr,
+                                                    &wakeup_channel,
+                                                ) {
+                                                    break;
+                                                }
+                                            }
+                                            ClientMessage::ReloadFile {
+                                                path,
+                                                wait,
+                                                timeout_ms,
+                                            } => {
+                                                log::info!(
+                                                    "tcp server ReloadFile action: path {path}"
+                                                );
+                                                if !handle_reload_with_wait(
+                                                    ClientMessage::ReloadFile {
+                                                        path,
+                                                        wait,
+                                                        timeout_ms,
+                                                    },
+                                                    wait,
+                                                    timeout_ms,
+                                                    &mut stream,
+                                                    &kanata,
+                                                    &connections,
+                                                    &addr,
+                                                    &wakeup_channel,
                                                 ) {
                                                     break;
                                                 }
@@ -291,10 +448,10 @@ impl TcpServer {
                                         }
                                         use kanata_parser::keys::*;
                                         wakeup_channel
-                                            .send(KeyEvent {
-                                                code: OsCode::KEY_RESERVED,
-                                                value: KeyValue::WakeUp,
-                                            })
+                                            .send(KeyEvent::new(
+                                                OsCode::KEY_RESERVED,
+                                                KeyValue::WakeUp,
+                                            ))
                                             .expect("write key event");
                                     }
                                     Err(e) => {

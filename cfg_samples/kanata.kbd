@@ -170,6 +170,14 @@ If you need help, please feel welcome to ask in the GitHub discussions.
   ;; not work too well with other applications that use WH_KEYBOARD_LL.
   ;; Known applications with issues: GWSL/VcXsrv
 
+  ;; Windows without Interception has default behaviour to mitigate against
+  ;; unsynchronized Kanata and Windows keystates.
+  ;; The default value is: clear-kanata-states
+  ;;
+  ;; windows-sync-keystates  none
+  ;; windows-sync-keystates  clear-kanata-states
+  ;; windows-sync-keystates  clear-kanata-and-os-states
+
   ;; Enable kanata to execute commands.
   ;;
   ;; I consider this feature a hazard so it is conditionally compiled out of
@@ -295,6 +303,13 @@ If you need help, please feel welcome to ask in the GitHub discussions.
   ;; changes will be logged.
   ;;
   ;; log-layer-changes no
+
+  ;; By default (no), the entire definition of the layer is printed to the log.
+  ;; When set to `yes`, only the *name* of the layer is printed, instead.
+  ;; This option doesn't do anything if `log-layer-changes no`.
+  ;; However, *will* be recognized if you pass the `--log-layer-changes` cli flag.
+  ;; (as doing so effectively sets `log-layer-changes` to yes)
+  ;; log-layer-changes-name-only yes
 
   ;; This configuration will press and then immediately release the non-modifier key
   ;; as soon as the override activates, meaning you are unlikely as a human to ever
@@ -469,6 +484,13 @@ If you need help, please feel welcome to ask in the GitHub discussions.
 (defalias
   th1 (tap-hold $tt $ht caps lctl)
   th2 (tap-hold $tt $ht spc lsft)
+
+  ;; tap-hold-opposite-hand-release is a release-time variant of
+  ;; tap-hold-opposite-hand. It waits for the interrupting key to be pressed
+  ;; AND released before deciding, which avoids misfires on fast same-hand
+  ;; rolls. Requires defhands.
+  ;; actl (tap-hold-opposite-hand-release 200 a lctl
+  ;;   (same-hand tap) (unknown-hand hold) (timeout hold))
 )
 
 ;; defalias is used to declare a shortcut for a more complicated action to keep
@@ -552,13 +574,38 @@ If you need help, please feel welcome to ask in the GitHub discussions.
   ect2 (tap-hold-release-timeout 200 200 e @chr esc reset-timeout-on-press)
 
   ;; There is another variant of `tap-hold-release` that takes a 5th parameter
-  ;; that is a list of keys that will trigger an early tap.
+  ;; that is a list of keys that will trigger an early tap when pressed.
 
   ;; tap: u    hold: misc layer      early tap if any of: (a o e) are pressed
   umk (tap-hold-release-keys 200 200 u @msc (a o e))
 
+  ;; A variant of tap-hold-release-keys accepts another parameter,
+  ;; which is a list of keys that activates the tap
+  ;; on a press->release of a listed key.
+  umk2 (tap-hold-release-tap-keys-release 200 200 u @msc (a o e) (' , .))
+
   ;; tap: u    hold: misc layer      always tap if any of: (a o e) are pressed
   uek (tap-hold-except-keys 200 200 u @msc (a o e))
+
+  ;; tap: u    hold: misc layer      early tap if any of: (a o e) are pressed
+  ;; Unlike tap-hold-release-keys, other keys do NOT trigger early hold.
+  ;; This is useful for home row mods where fast typing should not trigger modifiers.
+  utk (tap-hold-tap-keys 200 200 u @msc (a o e))
+
+  ;; tap-hold-keys is a flexible tap-hold with named key list options.
+  ;; tap: u    hold: misc layer
+  ;; (tap-on-press a o e)         — tap immediately if a, o, or e are pressed
+  ;; (tap-on-press-release ' , .) — tap if ', ,, or . are pressed then released
+  ;; (hold-on-press 1 2 3)        — hold immediately if 1, 2, or 3 are pressed
+  ;; All list options are optional. Unlisted keys use PermissiveHold behavior.
+  uthk (tap-hold-keys 200 200 u @msc
+    (tap-on-press a o e)
+    (tap-on-press-release ' , .)
+    (hold-on-press 1 2 3))
+
+  ;; tap-hold-order resolves by release order instead of timeout.
+  ;; tap: a    hold: lctl    buffer: 50ms (fast typing grace period)
+  aor (tap-hold-order 200 50 a lctl)
 
   ;; tap for capslk, hold for lctl
   cap (tap-hold 200 200 caps lctl)
@@ -686,6 +733,12 @@ If you need help, please feel welcome to ask in the GitHub discussions.
   um1 (unmod 1)
   ;; dead keys é (as opposed to using AltGr) that outputs É when shifted
   dké (macro (unmod ') e)
+  ;; You can suppress other arbitrary keys with suppress-keys
+  ;; This example is equivalent to unshift
+  uns (multi (suppress-keys lsft rsft) a)
+
+  ;; d:$key and u:$key allow individual press/release of a key
+  m24 (macro a b d:f24 c d e u:f24 f g)
 
   ;; unshift is like unmod but only releases shifts
   ;; In ISO German QWERTZ, force unshifted symbols even if shift is held
@@ -726,6 +779,10 @@ If you need help, please feel welcome to ask in the GitHub discussions.
   ;; not activate at all. Otherwise if fallthrough is used, the second case
   ;; will also activate sequentially after the first case.
   swt (switch
+    ;; If you have cmd enabled,
+    ;; you may choose to add `init-cmd` which will execute the program
+    ;; and you can later use `cmd-exit` to choose what to output based on exit code.
+    ;; (init-cmd powershell.exe -c "if (-not (Test-Path 'myfile')) { exit 1 }")
 
     ;; translating this keys check to some other common languages
     ;; this might look like:
@@ -777,6 +834,15 @@ If you need help, please feel welcome to ask in the GitHub discussions.
     ;; The base layer is not always the active layer.
     ((base-layer dvorak)) x break
     ((base-layer qwerty)) y break
+
+    ;; device-history evaluates to `true` if the Nth most recent device
+    ;; matches the given device ID defined in definputdevices. Currently macOS only.
+    ;; ((device-history 1 1)) x break
+    ;; ((device-history 2 1)) y break
+
+    ;; If you have cmd enabled, you can check on the
+    ;; exit code of the most recent `init-cmd` occurrence.
+    ;; ((cmd-exit 0)) a break
 
     ;; default case, empty list always evaluates to true.
     ;; break vs. fallthrough doesn't matter here
@@ -1056,6 +1122,20 @@ If you need help, please feel welcome to ask in the GitHub discussions.
   mwl (mwheel-left 50 120)
   mwr (mwheel-right 50 120)
 
+  ;; There are similar wheel actions with `-accel` that have
+  ;; accelerating/inertial scrolling.
+  ;; The parameters are:
+  ;; 1. initial velocity
+  ;; 2. maximum velocity
+  ;; 3. acceleration multiplier
+  ;; 4. deceleration multiplier
+  ;; The units are arbitrary.
+  ;; The author finds the values in the example below
+  ;; to be a decent-feeling starting paint.
+  ;; Experiment to find your preference.
+  mau (mwheel-accel-up   3 1200 1.15 0.93)
+  mad (mwheel-accel-down 3 1200 1.15 0.93)
+
   ;; Mouse movement actions.The first number is the interval in milliseconds
   ;; between mouse actions. The second number is the distance traveled per interval
   ;; in pixels.
@@ -1090,6 +1170,10 @@ If you need help, please feel welcome to ask in the GitHub discussions.
   ;; given time as you would like, but be warned that some values, such as 33
   ;; may not have correct pixel distance representations.
   fms (movemouse-speed 200)
+
+  ;; mousewheel-speed is the same as movemouse-speed but scales the scroll
+  ;; distance of the mwheel actions instead.
+  sms (mousewheel-speed 50)
 )
 
 (defalias
@@ -1470,6 +1554,30 @@ If you need help, please feel welcome to ask in the GitHub discussions.
     (template-expand common-overrides)
   )
 )
+
+#|
+There is a more recent version of defoverrides that offers more customizability.
+Instead of 2 list items per override entry,
+`defoverridesv2` mandates 4, though the extra 2 can be empty.
+
+You cannot have both a v1 and v2 of `defoverrides` at the same time.
+
+The 3rd item is an "exclude modifiers list" which is composed of modifier key names
+(such as `lctl`, `lalt`) that, if held, will disable the override from activating.
+
+The 4th item is an "exclude layers" list which is composed of layer names
+that while active as the most recent `layer-switch` or `layer-while-held`,
+will disable the override from activating.
+
+(defoverridesv2
+  ;; lctl+a will become lalt+9
+  ;; except when lsft is held or other-layer is active.
+  (lctl a) (lalt 9) (lsft) (other-layer))
+
+  ;; lctl+b will always become lalt+0
+  (lctl b) (lalt 0) () ()
+)
+|#
 
 #|
 

@@ -215,21 +215,43 @@ impl SExpr {
             SExpr::List(l) => l.span.clone(),
         }
     }
+
+    /// Shrinks the span from the start. Works only on an atom; it only adjusts the Position's
+    /// `absolute` field. An atom is guaranteed to all exist on the same line; otherwise a newline
+    /// would create a new atom.
+    ///
+    /// Returns None if the SExpr is a list, or if shrink_by would make the start equal or exceed
+    /// the end.
+    pub fn shrink_atom_span_from_start(&self, shrink_by: usize) -> Option<Self> {
+        match self {
+            SExpr::Atom(a) => {
+                let mut span = a.span.clone();
+                span.start.absolute += shrink_by;
+                if span.start.absolute >= span.end.absolute {
+                    None
+                } else {
+                    Some(SExpr::Atom(Spanned::new(
+                        a.t[shrink_by..].to_string(),
+                        span,
+                    )))
+                }
+            }
+            SExpr::List(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for SExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SExpr::Atom(a) => write!(f, "{}", &a.t),
+            SExpr::Atom(a) => write!(f, "{}", a.t),
             SExpr::List(l) => {
-                write!(f, "(")?;
-                for i in 0..l.t.len() - 1 {
-                    write!(f, "{:?} ", &l.t[i])?;
-                }
-                if let Some(last) = &l.t.last() {
-                    write!(f, "{last:?}")?;
-                }
-                write!(f, ")")?;
+                let inner =
+                    l.t.iter()
+                        .map(|x| format!("{x:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                write!(f, "({inner})")?;
                 Ok(())
             }
         }
@@ -564,18 +586,4 @@ fn parse_with(
         })
         .collect::<Result<_>>()?;
     Ok((exprs, metadata))
-}
-
-use miette::{Diagnostic, SourceSpan};
-use thiserror::Error;
-
-#[derive(Error, Debug, Diagnostic)]
-#[error("Error in configuration syntax")]
-#[diagnostic()]
-pub struct LexError {
-    // Snippets and highlights can be included in the diagnostic!
-    #[label("Here")]
-    pub err_span: SourceSpan,
-    #[help]
-    pub help_msg: String,
 }

@@ -1,57 +1,84 @@
 pub(crate) mod args;
 
+#[cfg(all(feature = "tcp_server", not(feature = "gui")))]
+pub(crate) mod msg;
+
 #[cfg(all(target_os = "windows", feature = "gui"))]
 pub(crate) mod win_gui;
 
 #[cfg(all(target_os = "macos", not(feature = "gui")))]
 pub(crate) fn list_devices_macos() {
-    use crate::oskbd::capture_stdout;
-    use karabiner_driverkit::list_keyboards;
+    use karabiner_driverkit::fetch_devices;
 
     println!("Available keyboard devices:");
-    println!("===========================");
+    println!("===========================\n");
 
-    let kb_list = capture_stdout(list_keyboards);
-    let device_names: Vec<&str> = kb_list.lines().collect();
+    let kb_list = fetch_devices();
 
-    if device_names.is_empty() {
+    let print_header = || {
+        println!(
+            "{:<20} {:<10} {:<10} product_key",
+            "hash", "vendor_id", "product_id"
+        );
+    };
+
+    let print_line = || {
+        println!(
+            "{}   {}   {}   {}",
+            "-".repeat(18),
+            "-".repeat(8),
+            "-".repeat(8),
+            "-".repeat(50)
+        );
+    };
+
+    print_header();
+    print_line();
+    for kb in kb_list.iter() {
+        println!("{}", kb);
+    }
+    print_line();
+
+    if kb_list.is_empty() {
         println!("No devices found. Ensure Karabiner-VirtualHIDDevice driver is activated.");
         return;
     }
 
-    let mut valid_count = 0;
-    let mut empty_count = 0;
-
-    for (i, device) in device_names.iter().enumerate() {
-        let trimmed = device.trim();
-        if trimmed.is_empty() {
-            println!("  {}. (empty name) - ⚠️  Will be skipped", i + 1);
-            empty_count += 1;
-        } else {
-            println!("  {}. \"{}\"", i + 1, trimmed);
-            valid_count += 1;
-        }
-    }
-
-    if empty_count > 0 {
+    let has_empty_names = kb_list.iter().any(|k| k.product_key.trim().is_empty());
+    if has_empty_names {
         println!(
-            "\n⚠️  Note: {empty_count} device(s) with empty names will be skipped to prevent crashes."
+            "\nTo address devices with empty names (product key), hash values can be used in the configuration!"
         );
     }
 
-    if valid_count > 0 {
-        println!("\nConfiguration example:");
-        println!("  (defcfg");
-        println!("    macos-dev-names-include (");
-        for device in device_names.iter().filter(|d| !d.trim().is_empty()) {
-            println!("      \"{}\"", device.trim());
-        }
-        println!("    )");
-        println!("  )");
+    if kb_list.iter().any(|k| k.product_key.contains("Karabiner")) {
+        println!(
+            "\nNote: Karabiner virtual devices detected. Device hashes may not be stable \
+             because Karabiner virtualizes HID devices. Prefer name-based matching."
+        );
     }
+
+    println!("\nConfiguration example:");
+    println!("  (defcfg");
+    println!("    macos-dev-names-include (");
+    for kb in kb_list
+        .iter()
+        .map(|k| k.product_key.clone())
+        .filter(|k| !k.trim().is_empty())
+    {
+        println!("      \"{}\"", kb.trim());
+    }
+    println!("    )");
+    println!("    or instead:");
+    println!("    macos-dev-names-include (");
+    for kb in kb_list.iter().map(|k| k.hash) {
+        println!("      \"0x{:<16X}\"", kb);
+    }
+    println!("    )");
+    println!("  )");
 }
 
-#[cfg(all(target_os = "linux", not(feature = "gui")))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "gui")))]
 pub(crate) fn list_devices_linux() {
     use crate::oskbd::discover_devices;
     use kanata_parser::cfg::DeviceDetectMode;
@@ -73,8 +100,17 @@ pub(crate) fn list_devices_linux() {
     println!("Found {} keyboard device(s):\n", devices.len());
 
     for (i, (device, path)) in devices.iter().enumerate() {
-        println!("  {}. \"{}\"", i + 1, device.name().unwrap_or("Unknown"));
+        let name = device.name().unwrap_or("Unknown");
+        let input_id = device.input_id();
+        println!("  {}. \"{}\"", i + 1, name);
         println!("     Path: {path}");
+        println!(
+            "     Vendor ID: {} (0x{:04X}), Product ID: {} (0x{:04X})",
+            input_id.vendor(),
+            input_id.vendor(),
+            input_id.product(),
+            input_id.product()
+        );
         println!();
     }
 
@@ -88,24 +124,14 @@ pub(crate) fn list_devices_linux() {
     println!("  )");
 }
 
-#[cfg(all(
-    target_os = "windows",
-    feature = "interception_driver",
-    not(feature = "gui")
-))]
-#[allow(dead_code)]
+#[cfg(all(target_os = "windows", feature = "interception_driver"))]
 struct WindowsDeviceInfo {
     display_name: String,        // For user display
     raw_wide_bytes: Vec<u8>,     // For kanata configuration (original wide string bytes)
     hardware_id: Option<String>, // Parsed hardware ID (e.g., "HID#VID_046D&PID_C52B")
 }
 
-#[cfg(all(
-    target_os = "windows",
-    feature = "interception_driver",
-    not(feature = "gui")
-))]
-#[allow(dead_code)]
+#[cfg(all(target_os = "windows", feature = "interception_driver"))]
 fn get_device_info(device_handle: winapi::um::winnt::HANDLE) -> Option<WindowsDeviceInfo> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -166,12 +192,7 @@ fn get_device_info(device_handle: winapi::um::winnt::HANDLE) -> Option<WindowsDe
     None
 }
 
-#[cfg(all(
-    target_os = "windows",
-    feature = "interception_driver",
-    not(feature = "gui")
-))]
-#[allow(dead_code)]
+#[cfg(all(target_os = "windows", feature = "interception_driver"))]
 pub(crate) fn list_devices_windows() {
     use std::ptr::null_mut;
     use winapi::shared::minwindef::{PUINT, UINT};
@@ -272,12 +293,7 @@ pub(crate) fn list_devices_windows() {
     }
 }
 
-#[cfg(all(
-    target_os = "windows",
-    feature = "interception_driver",
-    not(feature = "gui")
-))]
-#[allow(dead_code)]
+#[cfg(all(target_os = "windows", feature = "interception_driver"))]
 fn extract_hardware_id(device_name: &str) -> Option<String> {
     // Windows device names typically look like:
     // \\?\HID#VID_046D&PID_C52B&MI_01#7&1234abcd&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}

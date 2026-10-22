@@ -15,9 +15,13 @@ pub const TAP_HOLD_PRESS_TIMEOUT_A: &str = "tap⬓↓timeout";
 pub const TAP_HOLD_RELEASE_TIMEOUT: &str = "tap-hold-release-timeout";
 pub const TAP_HOLD_RELEASE_TIMEOUT_A: &str = "tap⬓↑timeout";
 pub const TAP_HOLD_RELEASE_KEYS: &str = "tap-hold-release-keys";
+pub const TAP_HOLD_RELEASE_KEYS_TAP_RELEASE: &str = "tap-hold-release-tap-keys-release";
 pub const TAP_HOLD_RELEASE_KEYS_A: &str = "tap⬓↑keys";
 pub const TAP_HOLD_EXCEPT_KEYS: &str = "tap-hold-except-keys";
 pub const TAP_HOLD_EXCEPT_KEYS_A: &str = "tap⬓⤫keys";
+pub const TAP_HOLD_TAP_KEYS: &str = "tap-hold-tap-keys";
+pub const TAP_HOLD_TAP_KEYS_A: &str = "tap⬓tapkeys";
+pub const TAP_HOLD_KEYS: &str = "tap-hold-keys";
 pub const MULTI: &str = "multi";
 pub const MACRO: &str = "macro";
 pub const MACRO_REPEAT: &str = "macro-repeat";
@@ -70,6 +74,11 @@ pub const MWHEEL_UP_A: &str = "🖱☸↑";
 pub const MWHEEL_DOWN_A: &str = "🖱☸↓";
 pub const MWHEEL_LEFT_A: &str = "🖱☸←";
 pub const MWHEEL_RIGHT_A: &str = "🖱☸→";
+pub const MWHEEL_ACCEL_UP: &str = "mwheel-accel-up";
+pub const MWHEEL_ACCEL_DOWN: &str = "mwheel-accel-down";
+pub const MWHEEL_ACCEL_LEFT: &str = "mwheel-accel-left";
+pub const MWHEEL_ACCEL_RIGHT: &str = "mwheel-accel-right";
+pub const MOUSEWHEEL_SPEED: &str = "mousewheel-speed";
 pub const MOVEMOUSE_UP: &str = "movemouse-up";
 pub const MOVEMOUSE_DOWN: &str = "movemouse-down";
 pub const MOVEMOUSE_LEFT: &str = "movemouse-left";
@@ -113,6 +122,7 @@ pub const SEQUENCE_NOERASE: &str = "sequence-noerase";
 pub const UNMOD: &str = "unmod";
 pub const UNSHIFT: &str = "unshift";
 pub const UNSHIFT_A: &str = "un⇧";
+pub const SUPPRESS_KEYS: &str = "suppress-keys";
 pub const LIVE_RELOAD_NUM: &str = "lrld-num";
 pub const LIVE_RELOAD_FILE: &str = "lrld-file";
 pub const ON_PRESS: &str = "on-press";
@@ -129,6 +139,9 @@ pub const CLIPBOARD_RESTORE: &str = "clipboard-restore";
 pub const CLIPBOARD_SAVE_SET: &str = "clipboard-save-set";
 pub const CLIPBOARD_SAVE_CMD_SET: &str = "clipboard-save-cmd-set";
 pub const CLIPBOARD_SAVE_SWAP: &str = "clipboard-save-swap";
+pub const TAP_HOLD_ORDER: &str = "tap-hold-order";
+pub const TAP_HOLD_OPPOSITE_HAND: &str = "tap-hold-opposite-hand";
+pub const TAP_HOLD_OPPOSITE_HAND_RELEASE: &str = "tap-hold-opposite-hand-release";
 
 pub fn is_list_action(ac: &str) -> bool {
     const LIST_ACTIONS: &[&str] = &[
@@ -145,9 +158,13 @@ pub fn is_list_action(ac: &str) -> bool {
         TAP_HOLD_RELEASE_TIMEOUT,
         TAP_HOLD_RELEASE_TIMEOUT_A,
         TAP_HOLD_RELEASE_KEYS,
+        TAP_HOLD_RELEASE_KEYS_TAP_RELEASE,
         TAP_HOLD_RELEASE_KEYS_A,
         TAP_HOLD_EXCEPT_KEYS,
         TAP_HOLD_EXCEPT_KEYS_A,
+        TAP_HOLD_TAP_KEYS,
+        TAP_HOLD_TAP_KEYS_A,
+        TAP_HOLD_KEYS,
         MULTI,
         MACRO,
         MACRO_REPEAT,
@@ -193,6 +210,11 @@ pub fn is_list_action(ac: &str) -> bool {
         MWHEEL_LEFT_A,
         MWHEEL_RIGHT,
         MWHEEL_RIGHT_A,
+        MWHEEL_ACCEL_UP,
+        MWHEEL_ACCEL_DOWN,
+        MWHEEL_ACCEL_LEFT,
+        MWHEEL_ACCEL_RIGHT,
+        MOUSEWHEEL_SPEED,
         MOVEMOUSE_UP,
         MOVEMOUSE_UP_A,
         MOVEMOUSE_DOWN,
@@ -236,6 +258,7 @@ pub fn is_list_action(ac: &str) -> bool {
         UNMOD,
         UNSHIFT,
         UNSHIFT_A,
+        SUPPRESS_KEYS,
         LIVE_RELOAD_NUM,
         LIVE_RELOAD_FILE,
         ON_PRESS,
@@ -257,6 +280,9 @@ pub fn is_list_action(ac: &str) -> bool {
         CLIPBOARD_SAVE_SET,
         CLIPBOARD_SAVE_CMD_SET,
         CLIPBOARD_SAVE_SWAP,
+        TAP_HOLD_ORDER,
+        TAP_HOLD_OPPOSITE_HAND,
+        TAP_HOLD_OPPOSITE_HAND_RELEASE,
     ];
     LIST_ACTIONS.contains(&ac)
 }

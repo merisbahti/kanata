@@ -31,6 +31,7 @@ You can see a [list of known issues here](./docs/platform-known-issues.adoc).
 ### Demo
 
 #### Demo video
+
 [Showcase of multi-layer functionality (30s, 1.7 MB)](https://user-images.githubusercontent.com/6634136/183001314-f64a7e26-4129-4f20-bf26-7165a6e02c38.mp4).
 
 #### Online simulator
@@ -123,7 +124,7 @@ Sample configuration files are found in [cfg_samples](./cfg_samples). The
 that is hopefully easy to understand but does not contain all features. The
 `kanata.kbd` contains an example of all features with documentation. The
 release assets also have a `kanata.kbd` file that is tested to work with that
-release. All key names can be found in the [keys module](./src/keys/mod.rs),
+release. All key names can be found in the [keys module](./parser/src/keys/mod.rs),
 and you can also define your own key names.
 
 </details>
@@ -165,11 +166,17 @@ For example:
 cargo build --release --features cmd,interception_driver
 cargo install --features cmd,interception_driver
 ```
+
 </details>
 
 ## Other installation methods
 
+<details>
+<summary>Repositories for kanata</summary>
+
 [![Packaging status](https://repology.org/badge/vertical-allrepos/kanata.svg)](https://repology.org/project/kanata/versions)
+
+</details>
 
 ## Notable features
 
@@ -196,6 +203,7 @@ Unless explicitly stated otherwise, your contributions to kanata will be made
 under the LGPL-3.0-only[*] license.
 
 Some directories are exceptions:
+
 - [keyberon](./keyberon): MIT License
 - [interception](./interception): MIT or Apache-2.0 Licenses
 
@@ -220,13 +228,16 @@ Some directories are exceptions:
 - [komokana](https://github.com/LGUG2Z/komokana): Automatic application-aware layer switching for [`komorebi`](https://github.com/LGUG2Z/komorebi) (Windows)
 - [kanata-tray](https://github.com/rszyma/kanata-tray): Control kanata from a tray icon
 - [OverKeys](https://github.com/conventoangelo/overkeys): Visual layer display for kanata - see your active layers and keymaps in real-time (Windows)
+- [Glide](https://github.com/tompassarelli/glide): detect touchpad gestures to integrate with Kanata virtual keys (Linux)
 - Application-aware layer switching:
-   - [qanata (Linux)](https://github.com/veyxov/qanata)
-   - [kanawin (Windows)](https://github.com/Aqaao/kanawin)
-   - [window_tools (Windows)](https://github.com/reidprichard/window_tools)
-   - [nata (Linux)](https://github.com/mdSlash/nata)
-   - [kanata-vk-agent (macOS)](https://github.com/devsunb/kanata-vk-agent)
-   - [hyprkan (Linux)](https://github.com/mdSlash/hyprkan)
+  - [qanata (Linux)](https://github.com/veyxov/qanata)
+  - [kanawin (Windows)](https://github.com/Aqaao/kanawin)
+  - [window_tools (Windows)](https://github.com/reidprichard/window_tools)
+  - [nata (Linux)](https://github.com/mdSlash/nata)
+  - [kanata-vk-agent (macOS)](https://github.com/devsunb/kanata-vk-agent)
+  - [hyprkan (Linux)](https://github.com/mdSlash/hyprkan)
+  - [kanata-switcher (Linux, all DEs)](https://github.com/7mind/kanata-switcher)
+  - [kwanata (Linux-KDE)](https://github.com/jfsicilia/kwanata): A KDE Plasma companion for Kanata - Automatically activates Kanata's layers/virtualkeys and launches or raises apps.
 
 ## What does the name mean?
 
@@ -290,6 +301,7 @@ at the time of writing that make kmonad suboptimal for my personal workflows.
 This project is written in Rust because Rust is my favourite programming
 language and the prior work of the awesome [keyberon crate](https://github.com/TeXitoi/keyberon)
 exists.
+
 </details>
 
 ## Similar Projects
@@ -302,7 +314,6 @@ Other similar projects:
 - [keyberon](https://github.com/TeXitoi/keyberon): Rust `#[no_std]` library intended for keyboard firmware
 - [ktrl](https://github.com/ItayGarin/ktrl): Linux-only keyboard customizer with layers, a TCP server, and audio support
 - [kbremap](https://github.com/timokroeger/kbremap): Windows-only keyboard customizer with layers and unicode
-- [xcape](https://github.com/alols/xcape): Linux-only tap-hold modifiers
 - [karabiner-elements](https://karabiner-elements.pqrs.org/): Mac-only keyboard customizer
 - [capsicain](https://github.com/cajhin/capsicain): Windows-only key remapper with driver-level key interception
 - [keyd](https://github.com/rvaiya/keyd): Linux-only key remapper very similar to QMK, kmonad, and kanata

@@ -1,7 +1,8 @@
 use anyhow::Result;
 use anyhow::{anyhow, bail};
 use clap::Parser;
-use kanata_state_machine::{oskbd::*, *};
+use kanata_state_machine::kanata::handle_fakekey_action;
+use kanata_state_machine::{FAKE_KEY_ROW, FakeKeyAction, oskbd::*, *};
 use simplelog::{format_description, *};
 use std::path::PathBuf;
 
@@ -94,7 +95,7 @@ fn log_init() {
         LevelFilter::Info,
         log_cfg.build(),
         TerminalMode::Stderr,
-        ColorChoice::AlwaysAnsi,
+        ColorChoice::Auto,
     )])
     .expect("logger can init");
 }
@@ -137,7 +138,7 @@ fn cli_init_fsim() -> Result<(ValidatedArgs, Vec<PathBuf>, Option<String>)> {
             paths: cfg_paths,
             #[cfg(feature = "tcp_server")]
             tcp_server_address: None::<SocketAddrWrapper>,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             symlink_path: None,
             nodelay: true,
         },
@@ -151,6 +152,51 @@ fn split_at_1(s: &str) -> (&str, &str) {
         Some(c) => s.split_at(c.len_utf8()),
         None => s.split_at(0),
     }
+}
+
+fn parse_fakekey_spec(spec: &str) -> Result<(&str, FakeKeyAction)> {
+    let (name, action) = match spec.split_once(':') {
+        Some((name, action_str)) => {
+            let action = match action_str {
+                "press" | "p" => FakeKeyAction::Press,
+                "release" => FakeKeyAction::Release,
+                "tap" | "t" => FakeKeyAction::Tap,
+                "toggle" | "g" => FakeKeyAction::Toggle,
+                _ => bail!(
+                    "unknown fakekey action: {action_str}. Expected: press, release, tap, or toggle"
+                ),
+            };
+            (name, action)
+        }
+        None => (spec, FakeKeyAction::Press),
+    };
+
+    if name.is_empty() {
+        bail!("fakekey name cannot be empty");
+    }
+
+    Ok((name, action))
+}
+
+fn apply_fakekey_action(k: &mut Kanata, name: &str, action: FakeKeyAction) -> Result<()> {
+    let index = k
+        .virtual_keys
+        .get(name)
+        .ok_or_else(|| anyhow!("unknown virtual key: {name}"))?;
+    log::info!("fakekey action: {name} {action:?}");
+    handle_fakekey_action(action, k.layout.bm(), FAKE_KEY_ROW, *index as u16);
+    Ok(())
+}
+
+fn apply_layer_switch(k: &mut Kanata, layer_name: &str) -> Result<()> {
+    let layer_idx = k
+        .layer_info
+        .iter()
+        .position(|l| l.name == layer_name)
+        .ok_or_else(|| anyhow!("unknown layer: {layer_name}"))?;
+    log::info!("layer-switch: {layer_name} (index {layer_idx})");
+    k.layout.bm().set_default_layer(layer_idx);
+    Ok(())
 }
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum LogFmtT {
@@ -229,28 +275,32 @@ fn main_impl() -> Result<()> {
                             let key_code =
                                 str_to_oscode(val).ok_or_else(|| anyhow!("unknown key: {val}"))?;
                             kbd_out_log(&mut k.kbd_out, LogFmtT::InKeyDown, Some(key_code), None);
-                            k.handle_input_event(&KeyEvent {
-                                code: key_code,
-                                value: KeyValue::Press,
-                            })?;
+                            k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Press))?;
                         }
                         "release" | "↑" | "u" | "up" => {
                             let key_code =
                                 str_to_oscode(val).ok_or_else(|| anyhow!("unknown key: {val}"))?;
                             kbd_out_log(&mut k.kbd_out, LogFmtT::InKeyUp, Some(key_code), None);
-                            k.handle_input_event(&KeyEvent {
-                                code: key_code,
-                                value: KeyValue::Release,
-                            })?;
+                            k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Release))?;
                         }
                         "repeat" | "⟳" | "r" => {
                             let key_code =
                                 str_to_oscode(val).ok_or_else(|| anyhow!("unknown key: {val}"))?;
                             kbd_out_log(&mut k.kbd_out, LogFmtT::InKeyRep, Some(key_code), None);
-                            k.handle_input_event(&KeyEvent {
-                                code: key_code,
-                                value: KeyValue::Repeat,
-                            })?;
+                            k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Repeat))?;
+                        }
+                        // Virtual/fake key activation: fakekey:name[:action] or vk:name[:action]
+                        // Supported actions: press, release, tap, toggle
+                        // Examples: fakekey:vk_bear:press, vk:vk_bear, virtualkey:vk_bear:tap
+                        "fakekey" | "vk" | "virtualkey" | "🎭" => {
+                            let (vk_name, action) = parse_fakekey_spec(val)?;
+                            apply_fakekey_action(&mut k, vk_name, action)?;
+                        }
+                        // Layer switch: ls:layer_name
+                        // Switches to the specified layer as the new default layer.
+                        // Example: ls:nav, ls:symbols
+                        "ls" | "layer-switch" | "🔀" => {
+                            apply_layer_switch(&mut k, val)?;
                         }
                         _ => bail!("invalid pair prefix: {kind}"),
                     },
@@ -272,19 +322,13 @@ fn main_impl() -> Result<()> {
                                     Some(key_code),
                                     None,
                                 );
-                                k.handle_input_event(&KeyEvent {
-                                    code: key_code,
-                                    value: KeyValue::Press,
-                                })?;
+                                k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Press))?;
                             }
                             "↑" => {
                                 let key_code = str_to_oscode(val)
                                     .ok_or_else(|| anyhow!("unknown key: {val}"))?;
                                 kbd_out_log(&mut k.kbd_out, LogFmtT::InKeyUp, Some(key_code), None);
-                                k.handle_input_event(&KeyEvent {
-                                    code: key_code,
-                                    value: KeyValue::Release,
-                                })?;
+                                k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Release))?;
                             }
                             "⟳" => {
                                 let key_code = str_to_oscode(val)
@@ -295,10 +339,18 @@ fn main_impl() -> Result<()> {
                                     Some(key_code),
                                     None,
                                 );
-                                k.handle_input_event(&KeyEvent {
-                                    code: key_code,
-                                    value: KeyValue::Repeat,
-                                })?;
+                                k.handle_input_event(&KeyEvent::new(key_code, KeyValue::Repeat))?;
+                            }
+                            "🎭" => {
+                                // Virtual key activation with emoji prefix (defaults to press)
+                                // Format: 🎭vk_name or 🎭vk_name:action
+                                let (vk_name, action) = parse_fakekey_spec(val)?;
+                                apply_fakekey_action(&mut k, vk_name, action)?;
+                            }
+                            "🔀" => {
+                                // Layer switch with emoji prefix
+                                // Format: 🔀layer_name
+                                apply_layer_switch(&mut k, val)?;
                             }
                             _ => bail!("invalid pair: {l}"),
                         }
